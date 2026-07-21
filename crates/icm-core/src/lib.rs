@@ -12,6 +12,7 @@ pub mod learn;
 pub mod memoir;
 pub mod memoir_store;
 pub mod memory;
+pub mod remote_protocol;
 pub mod store;
 pub mod transcript;
 pub mod transcript_store;
@@ -38,6 +39,7 @@ pub use memoir_store::MemoirStore;
 pub use memory::{
     Importance, Memory, MemorySource, PatternCluster, Scope, StoreStats, TopicHealth,
 };
+pub use remote_protocol::{is_known_method, RpcRequest, RpcResponse, ALL_METHODS};
 pub use store::{find_similar_memory, MemoryStore, DEDUP_SIMILARITY_THRESHOLD};
 pub use transcript::{Message, Role, Session, TranscriptHit, TranscriptStats};
 pub use transcript_store::TranscriptStore;
