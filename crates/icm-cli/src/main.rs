@@ -1409,41 +1409,135 @@ fn resolve_embedding_dims(
     }
 }
 
+/// Embedder provider selected from `[embeddings] provider` (F-001).
+#[derive(Debug, PartialEq, Eq)]
+enum EmbedderKind {
+    Local,
+    OpenAi {
+        base_url: String,
+        model: String,
+        dims: usize,
+    },
+}
+
+/// Map the `[embeddings] provider` config value to an [`EmbedderKind`].
+/// Unknown values fall back to `Local` so a typo degrades safely rather
+/// than silently disabling embeddings.
+fn resolve_embedder_kind(provider: &str, base_url: &str, model: &str, dims: usize) -> EmbedderKind {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "openai" | "cloud" => EmbedderKind::OpenAi {
+            base_url: base_url.to_string(),
+            model: model.to_string(),
+            dims,
+        },
+        _ => EmbedderKind::Local,
+    }
+}
+
+/// Directory for the disk-persistent embedding cache (F-001).
+#[cfg(feature = "cloud-embeddings")]
+fn embed_cache_dir() -> PathBuf {
+    directories::ProjectDirs::from("dev", "icm", "icm")
+        .map(|d| d.cache_dir().join("embeddings"))
+        .unwrap_or_else(|| PathBuf::from(".icm-cache/embeddings"))
+}
+
+/// Build the active embedder from config, boxed as a trait object so the
+/// local (fastembed) and cloud (OpenAI + cache) providers share one type.
+/// Returns `None` when the selected provider's build feature is absent —
+/// the caller then falls back to keyword/FTS search.
+fn build_embedder(cfg: &config::Config) -> Option<Box<dyn icm_core::Embedder + Send + Sync>> {
+    match resolve_embedder_kind(
+        &cfg.embeddings.provider,
+        &cfg.embeddings.base_url,
+        &cfg.embeddings.model,
+        cfg.embeddings.dimensions,
+    ) {
+        EmbedderKind::Local => build_local_embedder(&cfg.embeddings.model),
+        EmbedderKind::OpenAi {
+            base_url,
+            model,
+            dims,
+        } => build_openai_embedder(&base_url, &model, dims),
+    }
+}
+
 #[cfg(feature = "embeddings")]
-fn init_embedder(model: &str) -> Option<icm_core::FastEmbedder> {
-    Some(icm_core::FastEmbedder::with_model(model))
-}
-
-/// Placeholder embedder for builds without the `embeddings` feature.
-///
-/// It is never instantiated (`init_embedder` always returns `None` and the
-/// runtime guards on `embeddings_enabled`), but giving the no-embeddings
-/// build a concrete `Embedder` type lets the many
-/// `embedder.as_ref().map(|e| e as &dyn Embedder)` call sites compile
-/// without per-site `#[cfg]` gates.
-#[cfg(not(feature = "embeddings"))]
-struct DisabledEmbedder;
-
-#[cfg(not(feature = "embeddings"))]
-impl icm_core::Embedder for DisabledEmbedder {
-    fn embed(&self, _text: &str) -> icm_core::IcmResult<Vec<f32>> {
-        Err(icm_core::IcmError::Embedding(
-            "this build was compiled without the `embeddings` feature".into(),
-        ))
-    }
-    fn embed_batch(&self, _texts: &[&str]) -> icm_core::IcmResult<Vec<Vec<f32>>> {
-        Err(icm_core::IcmError::Embedding(
-            "this build was compiled without the `embeddings` feature".into(),
-        ))
-    }
-    fn dimensions(&self) -> usize {
-        icm_core::DEFAULT_EMBEDDING_DIMS
-    }
+fn build_local_embedder(model: &str) -> Option<Box<dyn icm_core::Embedder + Send + Sync>> {
+    Some(Box::new(icm_core::FastEmbedder::with_model(model)))
 }
 
 #[cfg(not(feature = "embeddings"))]
-fn init_embedder(_model: &str) -> Option<DisabledEmbedder> {
+fn build_local_embedder(_model: &str) -> Option<Box<dyn icm_core::Embedder + Send + Sync>> {
     None
+}
+
+#[cfg(feature = "cloud-embeddings")]
+fn build_openai_embedder(
+    base_url: &str,
+    model: &str,
+    dims: usize,
+) -> Option<Box<dyn icm_core::Embedder + Send + Sync>> {
+    // Key comes from the environment only, never config-on-disk, and is
+    // never logged. `ICM_EMBED_API_KEY` wins so a cloud embed key can
+    // differ from any `OPENAI_API_KEY` used elsewhere.
+    let key = std::env::var("ICM_EMBED_API_KEY")
+        .or_else(|_| std::env::var("OPENAI_API_KEY"))
+        .unwrap_or_default();
+    let dims = if dims == 0 { 1536 } else { dims };
+    let base = icm_core::OpenAiEmbedder::new(base_url, &key, model, dims);
+    // Wrap in the caching decorator so repeated embeds skip the paid API
+    // and populate the `/cache` metrics.
+    Some(Box::new(icm_core::CachingEmbedder::with_dir(
+        Box::new(base),
+        model,
+        4096,
+        &embed_cache_dir(),
+    )))
+}
+
+#[cfg(not(feature = "cloud-embeddings"))]
+fn build_openai_embedder(
+    base_url: &str,
+    model: &str,
+    dims: usize,
+) -> Option<Box<dyn icm_core::Embedder + Send + Sync>> {
+    let _ = (base_url, model, dims);
+    tracing::warn!(
+        "[embeddings] provider=openai requires the `cloud-embeddings` build feature; \
+         embeddings disabled for this run"
+    );
+    None
+}
+
+#[cfg(test)]
+mod embedder_kind_tests {
+    use super::*;
+
+    #[test]
+    fn provider_openai_selects_cloud() {
+        let kind = resolve_embedder_kind("openai", "https://x/v1", "m", 1536);
+        assert_eq!(
+            kind,
+            EmbedderKind::OpenAi {
+                base_url: "https://x/v1".into(),
+                model: "m".into(),
+                dims: 1536,
+            }
+        );
+    }
+
+    #[test]
+    fn provider_local_and_unknown_select_local() {
+        assert_eq!(
+            resolve_embedder_kind("local", "", "m", 0),
+            EmbedderKind::Local
+        );
+        assert_eq!(
+            resolve_embedder_kind("bogus", "", "m", 0),
+            EmbedderKind::Local
+        );
+    }
 }
 
 fn main() -> Result<()> {
@@ -1466,13 +1560,13 @@ fn main() -> Result<()> {
     let embeddings_enabled =
         cfg.embeddings.enabled && !cli.no_embeddings && std::env::var("ICM_NO_EMBEDDINGS").is_err();
     #[allow(unused_variables)]
-    let embedder = if embeddings_enabled {
-        init_embedder(&cfg.embeddings.model)
+    let embedder: Option<Box<dyn icm_core::Embedder + Send + Sync>> = if embeddings_enabled {
+        build_embedder(&cfg)
     } else {
         None
     };
     let embedding_dims = resolve_embedding_dims(
-        embedder.as_ref().map(|e| e as &dyn icm_core::Embedder),
+        embedder.as_deref().map(|e| e as &dyn icm_core::Embedder),
         cli.db.first(),
         &cfg,
     );
@@ -1528,7 +1622,7 @@ fn main() -> Result<()> {
             raw,
         } => {
             #[cfg(feature = "embeddings")]
-            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            let emb_ref = embedder.as_deref().map(|e| e as &dyn icm_core::Embedder);
             #[cfg(not(feature = "embeddings"))]
             let emb_ref: Option<&dyn icm_core::Embedder> = None;
             cmd_store(
@@ -1549,7 +1643,7 @@ fn main() -> Result<()> {
             keywords,
         } => {
             #[cfg(feature = "embeddings")]
-            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            let emb_ref = embedder.as_deref().map(|e| e as &dyn icm_core::Embedder);
             #[cfg(not(feature = "embeddings"))]
             let emb_ref: Option<&dyn icm_core::Embedder> = None;
             cmd_remember(
@@ -1571,7 +1665,7 @@ fn main() -> Result<()> {
             format,
         } => {
             #[cfg(feature = "embeddings")]
-            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            let emb_ref = embedder.as_deref().map(|e| e as &dyn icm_core::Embedder);
             #[cfg(not(feature = "embeddings"))]
             let emb_ref: Option<&dyn icm_core::Embedder> = None;
             cmd_recall(
@@ -1600,7 +1694,7 @@ fn main() -> Result<()> {
             keywords,
         } => {
             #[cfg(feature = "embeddings")]
-            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            let emb_ref = embedder.as_deref().map(|e| e as &dyn icm_core::Embedder);
             #[cfg(not(feature = "embeddings"))]
             let emb_ref: Option<&dyn icm_core::Embedder> = None;
             cmd_update(&store, emb_ref, &id, content, importance, keywords)
@@ -1723,7 +1817,7 @@ fn main() -> Result<()> {
             model,
             dry_run,
         } => {
-            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            let emb_ref = embedder.as_deref().map(|e| e as &dyn icm_core::Embedder);
             cmd_extract_pending(
                 &store,
                 emb_ref,
@@ -1758,7 +1852,7 @@ fn main() -> Result<()> {
         } => {
             #[cfg(feature = "embeddings")]
             {
-                let emb = match embedder.as_ref() {
+                let emb: &dyn icm_core::Embedder = match embedder.as_deref() {
                     Some(e) => e,
                     None => bail!("embeddings not available — check your configuration"),
                 };
@@ -1847,7 +1941,7 @@ fn main() -> Result<()> {
             if enqueue {
                 cmd_extract_enqueue(&store, &project, text)
             } else {
-                let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+                let emb_ref = embedder.as_deref().map(|e| e as &dyn icm_core::Embedder);
                 cmd_extract(&store, emb_ref, &project, text, dry_run, store_raw)
             }
         }
@@ -1885,7 +1979,7 @@ fn main() -> Result<()> {
             importance,
             keywords,
         } => {
-            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            let emb_ref = embedder.as_deref().map(|e| e as &dyn icm_core::Embedder);
             cmd_save_project(
                 &store,
                 emb_ref,
@@ -1948,12 +2042,12 @@ fn main() -> Result<()> {
             // stdio, so it's an `if let`, not an `else if expose`.
             #[cfg(feature = "http-api")]
             if let Some(addr) = http {
-                let boxed_emb: Option<Box<dyn icm_core::Embedder + Send + Sync>> =
-                    embedder.map(|e| Box::new(e) as Box<dyn icm_core::Embedder + Send + Sync>);
-                return http_api::run_http_server(store, boxed_emb, addr, token);
+                // `embedder` is already a boxed trait object (F-001); the
+                // HTTP server takes ownership of the warm embedder.
+                return http_api::run_http_server(store, embedder, addr, token);
             }
             #[cfg(feature = "embeddings")]
-            let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+            let emb_ref = embedder.as_deref().map(|e| e as &dyn icm_core::Embedder);
             #[cfg(not(feature = "embeddings"))]
             let emb_ref: Option<&dyn icm_core::Embedder> = None;
             // --compact flag overrides, otherwise use config (default: true)
@@ -1988,7 +2082,7 @@ fn main() -> Result<()> {
                     // CLI flag wins over config; absent flag falls back to config.
                     let extract_every = every.unwrap_or(cfg.extraction.extract_every);
                     #[cfg(feature = "embeddings")]
-                    let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+                    let emb_ref = embedder.as_deref().map(|e| e as &dyn icm_core::Embedder);
                     #[cfg(not(feature = "embeddings"))]
                     let emb_ref: Option<&dyn icm_core::Embedder> = None;
                     cmd_hook_post(
@@ -2003,7 +2097,7 @@ fn main() -> Result<()> {
                 }
                 HookCommands::Compact => {
                     #[cfg(feature = "embeddings")]
-                    let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+                    let emb_ref = embedder.as_deref().map(|e| e as &dyn icm_core::Embedder);
                     #[cfg(not(feature = "embeddings"))]
                     let emb_ref: Option<&dyn icm_core::Embedder> = None;
                     cmd_hook_compact(&store, emb_ref, &cfg.memory)
@@ -2019,7 +2113,7 @@ fn main() -> Result<()> {
                 }
                 HookCommands::End => {
                     #[cfg(feature = "embeddings")]
-                    let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
+                    let emb_ref = embedder.as_deref().map(|e| e as &dyn icm_core::Embedder);
                     #[cfg(not(feature = "embeddings"))]
                     let emb_ref: Option<&dyn icm_core::Embedder> = None;
                     cmd_hook_end(&store, emb_ref, &cfg.memory, &cfg.extraction.summarizer)

@@ -54,8 +54,23 @@ pub struct MemoryConfig {
 pub struct EmbeddingsConfig {
     /// Enable embeddings (set to false to skip model download entirely).
     pub enabled: bool,
-    /// Model identifier (fastembed model_code, e.g. "intfloat/multilingual-e5-small").
+    /// Model identifier. For `provider = "local"` this is a fastembed
+    /// model_code (e.g. "intfloat/multilingual-e5-small"); for
+    /// `provider = "openai"` it is the cloud model name (e.g.
+    /// "text-embedding-3-small").
     pub model: String,
+    /// Embedding provider (F-001): `"local"` (default, on-device
+    /// fastembed) or `"openai"` (any OpenAI-compatible `/embeddings`
+    /// endpoint). Requires the `cloud-embeddings` build feature for
+    /// `"openai"`.
+    pub provider: String,
+    /// Base URL for the `openai` provider, up to and including the API
+    /// version. Ignored for `local`.
+    pub base_url: String,
+    /// Output dimensionality for the `openai` provider (e.g. 1536 for
+    /// text-embedding-3-small). Ignored for `local`, whose dimensions
+    /// come from the loaded model.
+    pub dimensions: usize,
 }
 
 impl Default for EmbeddingsConfig {
@@ -63,6 +78,9 @@ impl Default for EmbeddingsConfig {
         Self {
             enabled: true,
             model: "intfloat/multilingual-e5-base".into(),
+            provider: "local".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            dimensions: 1536,
         }
     }
 }
