@@ -96,9 +96,37 @@ pub struct SqliteStore {
     /// (`store`, `update`, `delete`, etc.) check this and return
     /// `IcmError::ReadOnly`. Issue #263.
     readonly: bool,
+    /// Declared embedding dimensionality for this store (from
+    /// `icm_metadata.embedding_dims`). Used by the write-path dimension
+    /// guard (F-001): a memory carrying an embedding of a different
+    /// length is rejected rather than silently corrupting vector search
+    /// (which happens when the cloud embedder's dims, e.g. 1536, differ
+    /// from what the DB was created with, e.g. 384). `0` means "unknown"
+    /// (read-only / legacy DB) and disables the guard.
+    dims: usize,
 }
 
 impl SqliteStore {
+    /// Reject an embedding whose length disagrees with the store's
+    /// declared dimensionality. No-op when `dims == 0` (unknown) or the
+    /// memory carries no embedding.
+    fn ensure_embedding_dims(&self, embedding: Option<&Vec<f32>>) -> IcmResult<()> {
+        if self.dims == 0 {
+            return Ok(());
+        }
+        if let Some(v) = embedding {
+            if v.len() != self.dims {
+                return Err(IcmError::InvalidInput(format!(
+                    "embedding dimension {} does not match store dimension {}; \
+                     the embedding model changed — run `icm embed --force` to re-embed",
+                    v.len(),
+                    self.dims
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(path: &Path) -> IcmResult<Self> {
         Self::with_dims(path, icm_core::DEFAULT_EMBEDDING_DIMS)
     }
@@ -128,10 +156,13 @@ impl SqliteStore {
         // when another writer holds the file.
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=30000;")
             .map_err(db_err)?;
+        // Read-only stores never write, so the dimension guard is moot;
+        // `0` disables it. (Reads accept whatever dims are on disk.)
         Ok(Self {
             conn,
             cache: Mutex::new(new_cache()),
             readonly: true,
+            dims: 0,
         })
     }
 
@@ -207,6 +238,7 @@ impl SqliteStore {
             conn,
             cache: Mutex::new(new_cache()),
             readonly: false,
+            dims: embedding_dims,
         })
     }
 
@@ -662,6 +694,7 @@ impl SqliteStore {
             conn,
             cache: Mutex::new(new_cache()),
             readonly: false,
+            dims: embedding_dims,
         })
     }
 
@@ -976,6 +1009,7 @@ impl SqliteStore {
     /// that case. This keeps `store(...)` idempotent: writing the same
     /// fact 100× ends up with one row, not 100.
     fn store_inner(&self, memory: &Memory) -> IcmResult<String> {
+        self.ensure_embedding_dims(memory.embedding.as_ref())?;
         let keywords_json = serde_json::to_string(&memory.keywords)?;
         let related_json = serde_json::to_string(&memory.related_ids)?;
         let st = source_type(&memory.source);
@@ -1153,6 +1187,7 @@ impl MemoryStore for SqliteStore {
     }
 
     fn update(&self, memory: &Memory) -> IcmResult<()> {
+        self.ensure_embedding_dims(memory.embedding.as_ref())?;
         let keywords_json = serde_json::to_string(&memory.keywords)?;
         let related_json = serde_json::to_string(&memory.related_ids)?;
         let st = source_type(&memory.source);
@@ -3925,6 +3960,30 @@ mod tests {
             IcmError::Database(_) | IcmError::ReadOnly(_) => {}
             other => panic!("expected Database or ReadOnly, got {other:?}"),
         }
+    }
+
+    // === Embedding dimension guard (F-001) ===
+
+    #[test]
+    fn mismatched_dims_are_rejected_not_silent() {
+        use icm_core::{Importance, Memory, MemoryStore};
+        let s = SqliteStore::in_memory_with_dims(384).unwrap();
+        let mut m = Memory::new("t".to_string(), "c".to_string(), Importance::Medium);
+        m.embedding = Some(vec![0.0; 1536]); // wrong dimensionality
+        let err = s.store(m).unwrap_err();
+        assert!(
+            matches!(err, IcmError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn matching_dims_are_accepted() {
+        use icm_core::{Importance, Memory, MemoryStore};
+        let s = SqliteStore::in_memory_with_dims(384).unwrap();
+        let mut m = Memory::new("t".to_string(), "c".to_string(), Importance::Medium);
+        m.embedding = Some(vec![0.0; 384]);
+        assert!(s.store(m).is_ok());
     }
 
     // === Embedding dim peek (issue #267) ===
