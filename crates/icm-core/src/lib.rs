@@ -6,6 +6,8 @@ pub mod facts;
 pub mod facts_store;
 #[cfg(feature = "embeddings")]
 pub mod fastembed_embedder;
+#[cfg(feature = "cloud-embeddings")]
+pub mod openai_embedder;
 pub mod feedback;
 pub mod feedback_store;
 pub mod learn;
@@ -32,6 +34,8 @@ pub use facts::{Fact, FactsStats};
 pub use facts_store::FactsStore;
 #[cfg(feature = "embeddings")]
 pub use fastembed_embedder::FastEmbedder;
+#[cfg(feature = "cloud-embeddings")]
+pub use openai_embedder::OpenAiEmbedder;
 pub use feedback::{Feedback, FeedbackStats};
 pub use feedback_store::FeedbackStore;
 pub use memoir::{Concept, ConceptLink, Label, Memoir, MemoirStats, Relation};
