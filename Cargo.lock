@@ -1446,7 +1446,7 @@ dependencies = [
 
 [[package]]
 name = "icm-cli"
-version = "0.10.54"
+version = "0.10.57"
 dependencies = [
  "anyhow",
  "axum",
@@ -1488,12 +1488,15 @@ dependencies = [
  "chrono",
  "directories",
  "fastembed",
+ "lru 0.18.0",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
  "toml",
  "tracing",
  "ulid",
+ "ureq",
 ]
 
 [[package]]

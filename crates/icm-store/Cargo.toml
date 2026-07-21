@@ -31,6 +31,14 @@ postgres = ["dep:postgres", "dep:pgvector"]
 # `--no-default-features --features opensearch`.
 opensearch = ["dep:ureq", "dep:base64"]
 
+# Opt-in remote store client (F-001). `RemoteHttpStore` forwards every
+# store-trait call to a central `icm serve --http` node over JSON-RPC,
+# using the blocking `ureq` client (matches the synchronous store trait
+# surface — no async runtime). Selected at runtime via
+# `ICM_DB_BACKEND=remote` + `ICM_REMOTE_URL`. Additive: combines with any
+# local backend so one binary can be client or server.
+remote-store = ["dep:ureq"]
+
 [dependencies]
 icm-core = { path = "../icm-core" }
 serde_json = { workspace = true }

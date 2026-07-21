@@ -37,6 +37,24 @@ pub enum IcmError {
     /// unavailable on this backend.
     #[error("operation not supported on this storage backend: {0}")]
     Unsupported(String),
+
+    /// A remote store operation failed at the transport layer (issue
+    /// F-001): the client (`RemoteHttpStore`) could not reach the
+    /// central `icm serve --http` node, the HTTP response was not 200,
+    /// or the JSON-RPC envelope carried an error. Distinct from
+    /// [`IcmError::Database`] so callers can tell a network/transport
+    /// fault apart from a backend-local storage fault.
+    #[error("remote store error: {0}")]
+    Remote(String),
 }
 
 pub type IcmResult<T> = Result<T, IcmError>;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn remote_error_displays() {
+        let e = super::IcmError::Remote("connection refused".into());
+        assert_eq!(e.to_string(), "remote store error: connection refused");
+    }
+}

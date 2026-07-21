@@ -5,7 +5,13 @@ edition = "2021"
 
 [features]
 default = []
-embeddings = ["fastembed", "directories", "cachedir"]
+embeddings = ["dep:fastembed", "dep:directories", "dep:cachedir"]
+# OpenAI-compatible cloud embedder + disk/LRU embedding cache (F-001).
+# Additive and default-off: the lean build downloads no model and pays
+# no extra deps. `ureq` = blocking HTTP client (matches the sync store
+# surface, no async runtime); `sha2` = cache key hashing; `lru` =
+# in-memory hot layer; `directories` = default cache dir resolution.
+cloud-embeddings = ["dep:ureq", "dep:sha2", "dep:lru", "dep:directories"]
 
 [dependencies]
 chrono = { workspace = true }
@@ -18,3 +24,6 @@ fastembed = { workspace = true, optional = true }
 directories = { workspace = true, optional = true }
 cachedir = { workspace = true, optional = true }
 tracing = { workspace = true }
+ureq = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+lru = { workspace = true, optional = true }

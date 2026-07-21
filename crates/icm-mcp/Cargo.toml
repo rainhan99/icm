@@ -11,6 +11,10 @@ embeddings = ["icm-core/embeddings"]
 backend-sqlite = ["icm-store/backend-sqlite"]
 postgres = ["icm-store/postgres"]
 opensearch = ["icm-store/opensearch"]
+# Pass-through for the remote store client (F-001) so `cargo test -p
+# icm-mcp --features remote-store` can exercise the MCP server against a
+# remote backend.
+remote-store = ["icm-store/remote-store"]
 
 [dependencies]
 icm-core = { path = "../icm-core" }

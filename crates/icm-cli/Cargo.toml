@@ -19,6 +19,10 @@ path = "src/main.rs"
 # "embeddings,tui,http-api,backend-sqlite"`.
 default = ["embeddings", "tui", "http-api", "backend-sqlite", "postgres", "opensearch"]
 embeddings = ["icm-core/embeddings", "icm-mcp/embeddings"]
+# OpenAI-compatible cloud embedder + embedding cache (F-001). Additive,
+# default-OFF per the "single binary, zero deps" promise: the runtime
+# `[embeddings] provider` key selects local vs cloud when compiled in.
+cloud-embeddings = ["icm-core/cloud-embeddings"]
 tui = ["dep:ratatui", "dep:crossterm"]
 # Storage backends (additive). SQLite is in-process; postgres / opensearch
 # are network-accessible so several `icm` processes / Kubernetes replicas
@@ -26,6 +30,9 @@ tui = ["dep:ratatui", "dep:crossterm"]
 backend-sqlite = ["icm-store/backend-sqlite", "icm-mcp/backend-sqlite"]
 postgres = ["icm-store/postgres", "icm-mcp/postgres"]
 opensearch = ["icm-store/opensearch", "icm-mcp/opensearch"]
+# Remote store client (F-001), default-OFF. `ICM_DB_BACKEND=remote` makes
+# this icm a thin client of a central `icm serve --http` node.
+remote-store = ["icm-store/remote-store", "icm-mcp/remote-store"]
 # Persistent local HTTP server (`icm serve --http`) reusing the warm
 # store + embedder. Lightweight: just axum + tokio. Issue #290.
 http-api = ["dep:axum", "dep:tokio"]
