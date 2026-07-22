@@ -27,6 +27,13 @@ pub struct Memory {
     /// Cloud scope: user (local default), project, or org.
     #[serde(default)]
     pub scope: Scope,
+
+    /// When set, this memory was superseded by a newer near-duplicate
+    /// (F-003 heuristic supersession) and is excluded from recall/list by
+    /// default. `#[serde(default)]` keeps old rows/payloads (without the
+    /// field) deserializing to `None` = active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_at: Option<DateTime<Utc>>,
 }
 
 impl Memory {
@@ -53,7 +60,14 @@ impl Memory {
             related_ids: Vec::new(),
             embedding: None,
             scope: Scope::User,
+            superseded_at: None,
         }
+    }
+
+    /// True unless this memory has been superseded (F-003). Superseded
+    /// memories are excluded from recall/list by default.
+    pub fn is_active(&self) -> bool {
+        self.superseded_at.is_none()
     }
 }
 
@@ -196,5 +210,24 @@ impl TopicHealth {
         } else {
             "ok healthy"
         }
+    }
+}
+
+#[cfg(test)]
+mod supersede_field_tests {
+    use super::*;
+
+    #[test]
+    fn superseded_default_active() {
+        let m = Memory::new("t".to_string(), "c".to_string(), Importance::Medium);
+        assert!(m.superseded_at.is_none());
+        assert!(m.is_active());
+
+        // Old payloads (without the field) deserialize to None = active.
+        let mut obj = serde_json::to_value(&m).unwrap();
+        obj.as_object_mut().unwrap().remove("superseded_at");
+        let back: Memory = serde_json::from_value(obj).unwrap();
+        assert!(back.superseded_at.is_none());
+        assert!(back.is_active());
     }
 }
