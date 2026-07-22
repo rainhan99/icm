@@ -19,7 +19,10 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 
-use icm_core::{Embedder, IcmError, IcmResult, Memory, MemoryStore, RpcResponse};
+use icm_core::{
+    Embedder, FactsStore, Feedback, FeedbackStore, IcmError, IcmResult, Memory, MemoryStore,
+    RpcResponse,
+};
 use icm_store::Store;
 
 // --- param helpers -------------------------------------------------------
@@ -36,6 +39,10 @@ fn want_f32(p: &Value, k: &str) -> IcmResult<f32> {
         .and_then(Value::as_f64)
         .map(|n| n as f32)
         .ok_or_else(|| IcmError::InvalidInput(format!("missing number param '{k}'")))
+}
+
+fn opt_str(p: &Value, k: &str) -> Option<String> {
+    p.get(k).and_then(Value::as_str).map(str::to_string)
 }
 
 fn opt_usize(p: &Value, k: &str, default: usize) -> usize {
@@ -160,6 +167,53 @@ fn dispatch_inner(
         "memory.stats" => as_value(store.stats()?),
         "memory.topic_health" => as_value(store.topic_health(&want_str(p, "topic")?)?),
 
+        // --- FactsStore ---
+        "facts.set_fact" => as_value(store.set_fact(
+            &want_str(p, "entity")?,
+            &want_str(p, "key")?,
+            &want_str(p, "value")?,
+            &want_str(p, "source")?,
+        )?),
+        "facts.get_fact" => {
+            as_value(store.get_fact(&want_str(p, "entity")?, &want_str(p, "key")?)?)
+        }
+        "facts.list_facts" => {
+            let entity = want_str(p, "entity")?;
+            let prefix = opt_str(p, "key_prefix");
+            as_value(store.list_facts(&entity, prefix.as_deref())?)
+        }
+        "facts.history" => {
+            as_value(store.history(&want_str(p, "entity")?, &want_str(p, "key")?)?)
+        }
+        "facts.forget_fact" => {
+            as_value(store.forget_fact(&want_str(p, "entity")?, &want_str(p, "key")?)?)
+        }
+        "facts.facts_stats" => as_value(store.facts_stats()?),
+
+        // --- FeedbackStore ---
+        "feedback.store_feedback" => {
+            let f: Feedback = want_val(p, "feedback")?;
+            as_value(store.store_feedback(f)?)
+        }
+        "feedback.search_feedback" => {
+            let query = want_str(p, "query")?;
+            let topic = opt_str(p, "topic");
+            as_value(store.search_feedback(&query, topic.as_deref(), opt_usize(p, "limit", 10))?)
+        }
+        "feedback.list_feedback" => {
+            let topic = opt_str(p, "topic");
+            as_value(store.list_feedback(topic.as_deref(), opt_usize(p, "limit", 10))?)
+        }
+        "feedback.increment_applied" => {
+            store.increment_applied(&want_str(p, "id")?)?;
+            Ok(Value::Null)
+        }
+        "feedback.delete_feedback" => {
+            store.delete_feedback(&want_str(p, "id")?)?;
+            Ok(Value::Null)
+        }
+        "feedback.feedback_stats" => as_value(store.feedback_stats()?),
+
         other => Err(IcmError::InvalidInput(format!(
             "unknown store-RPC method: {other}"
         ))),
@@ -186,6 +240,32 @@ mod tests {
         let resp = dispatch(&store, None, "bogus.method", json!({}));
         assert!(resp.error.is_some());
         assert!(resp.result.is_none());
+    }
+
+    #[test]
+    fn facts_feedback_roundtrip() {
+        let store = Store::in_memory().unwrap();
+        // facts.set_fact then facts.get_fact returns the same value.
+        let set = dispatch(
+            &store,
+            None,
+            "facts.set_fact",
+            json!({"entity": "user", "key": "editor", "value": "helix", "source": "test"}),
+        );
+        assert!(set.error.is_none(), "set_fact: {:?}", set.error);
+        let got = dispatch(
+            &store,
+            None,
+            "facts.get_fact",
+            json!({"entity": "user", "key": "editor"}),
+        );
+        let fact = got.result.unwrap();
+        assert_eq!(fact["value"], json!("helix"));
+
+        // feedback.feedback_stats works on an empty store.
+        let stats = dispatch(&store, None, "feedback.feedback_stats", json!({}));
+        assert!(stats.error.is_none());
+        assert!(stats.result.unwrap().is_object());
     }
 
     #[test]
