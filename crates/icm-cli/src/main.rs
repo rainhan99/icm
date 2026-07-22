@@ -1,5 +1,7 @@
 mod archive;
 mod bench_data;
+#[cfg(feature = "code-graph")]
+mod code_index;
 mod bench_format;
 mod bench_knowledge;
 

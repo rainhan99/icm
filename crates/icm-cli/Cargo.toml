@@ -35,7 +35,7 @@ opensearch = ["icm-store/opensearch", "icm-mcp/opensearch"]
 remote-store = ["icm-store/remote-store", "icm-mcp/remote-store"]
 # Code-graph subsystem (F-002), default-ON (in `default` above); strip via
 # --no-default-features to drop tree-sitter entirely.
-code-graph = ["icm-core/code-graph", "icm-store/code-graph", "icm-mcp/code-graph"]
+code-graph = ["icm-core/code-graph", "icm-store/code-graph", "icm-mcp/code-graph", "dep:ignore"]
 # Persistent local HTTP server (`icm serve --http`) reusing the warm
 # store + embedder. Lightweight: just axum + tokio. Issue #290.
 http-api = ["dep:axum", "dep:tokio"]
@@ -85,6 +85,9 @@ mime_guess = { workspace = true, optional = true }
 getrandom = { workspace = true, optional = true }
 serde_json_lenient = { workspace = true }
 walkdir = { workspace = true }
+# Code-graph indexing (F-002): ripgrep's walker for correct .gitignore
+# handling. Optional, pulled only by the `code-graph` feature.
+ignore = { version = "0.4", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
