@@ -839,9 +839,7 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         related_ids,
         embedding,
         scope: icm_core::Scope::User, // default for existing local memories
-        superseded_at: row
-            .get::<_, Option<String>>(15)?
-            .map(|s| parse_dt(&s)),
+        superseded_at: row.get::<_, Option<String>>(15)?.map(|s| parse_dt(&s)),
     })
 }
 
@@ -1641,6 +1639,20 @@ impl MemoryStore for SqliteStore {
         collect_rows(rows)
     }
 
+    fn list_all_including_superseded(&self) -> IcmResult<Vec<Memory>> {
+        // Same as `list_all` but WITHOUT the `superseded_at IS NULL`
+        // predicate, so the caller can inspect temporal history.
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT {SELECT_COLS} FROM memories ORDER BY weight DESC LIMIT 10000"
+            ))
+            .map_err(db_err)?;
+
+        let rows = stmt.query_map([], row_to_memory).map_err(db_err)?;
+        collect_rows(rows)
+    }
+
     fn list_topics(&self) -> IcmResult<Vec<(String, usize)>> {
         let mut stmt = self
             .conn
@@ -1708,9 +1720,11 @@ impl MemoryStore for SqliteStore {
 
     fn count(&self) -> IcmResult<usize> {
         self.conn
-            .query_row("SELECT COUNT(*) FROM memories WHERE superseded_at IS NULL", [], |row| {
-                row.get::<_, usize>(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE superseded_at IS NULL",
+                [],
+                |row| row.get::<_, usize>(0),
+            )
             .map_err(|e| IcmError::Database(e.to_string()))
     }
 
@@ -3992,7 +4006,11 @@ mod tests {
     fn memory_superseded_persist() {
         use icm_core::{Importance, Memory, MemoryStore};
         let s = SqliteStore::in_memory_with_dims(384).unwrap();
-        let mut m = Memory::new("profile".to_string(), "user lives in NYC".to_string(), Importance::Medium);
+        let mut m = Memory::new(
+            "profile".to_string(),
+            "user lives in NYC".to_string(),
+            Importance::Medium,
+        );
         let id = s.store(m.clone()).unwrap();
         m.id = id.clone();
         // Mark superseded via the existing update() path (no new trait method).
@@ -4007,7 +4025,11 @@ mod tests {
     fn reads_exclude_superseded() {
         use icm_core::{Importance, Memory, MemoryStore};
         let s = SqliteStore::in_memory_with_dims(384).unwrap();
-        let a = Memory::new("t".to_string(), "alpha keeps".to_string(), Importance::Medium);
+        let a = Memory::new(
+            "t".to_string(),
+            "alpha keeps".to_string(),
+            Importance::Medium,
+        );
         let b = Memory::new("t".to_string(), "beta gone".to_string(), Importance::Medium);
         let _ida = s.store(a).unwrap();
         let idb = s.store(b).unwrap();
@@ -4020,8 +4042,10 @@ mod tests {
         assert_eq!(s.count_by_topic("t").unwrap(), 1);
         assert_eq!(s.list_all().unwrap().len(), 1);
         assert_eq!(s.get_by_topic("t").unwrap().len(), 1);
-        assert!(s.search_fts("beta", 5).unwrap().iter().all(|m| m.id != idb),
-                "superseded beta excluded from FTS");
+        assert!(
+            s.search_fts("beta", 5).unwrap().iter().all(|m| m.id != idb),
+            "superseded beta excluded from FTS"
+        );
         assert_eq!(s.search_fts("alpha", 5).unwrap().len(), 1);
         // Direct get(id) still returns a superseded memory (auditable).
         assert!(s.get(&idb).unwrap().is_some());
@@ -4032,18 +4056,30 @@ mod tests {
         use icm_core::{supersede_similar, Importance, Memory, MemoryStore};
         let s = SqliteStore::in_memory_with_dims(384).unwrap();
         // Existing active memory with a known embedding.
-        let mut old = Memory::new("profile".to_string(), "dark mode preferred".to_string(), Importance::Medium);
+        let mut old = Memory::new(
+            "profile".to_string(),
+            "dark mode preferred".to_string(),
+            Importance::Medium,
+        );
         old.embedding = Some(vec![1.0_f32; 384]);
         let old_id = s.store(old).unwrap();
 
         // A near-duplicate (same topic + same embedding) about to be stored.
-        let mut new = Memory::new("profile".to_string(), "dark mode preferred setting".to_string(), Importance::Medium);
+        let mut new = Memory::new(
+            "profile".to_string(),
+            "dark mode preferred setting".to_string(),
+            Importance::Medium,
+        );
         new.embedding = Some(vec![1.0_f32; 384]);
 
-        // Threshold 0.5: identical embedding → supersedes the old one.
-        let superseded = supersede_similar(&s, &new.topic, &new.embed_text(), new.embedding.as_ref().unwrap(), 0.5).unwrap();
+        // Identical embedding (cosine 1.0) → supersedes at the 0.90 default.
+        let superseded =
+            supersede_similar(&s, &new.topic, new.embedding.as_ref().unwrap(), 0.90).unwrap();
         assert_eq!(superseded.as_deref(), Some(old_id.as_str()));
-        assert!(!s.get(&old_id).unwrap().unwrap().is_active(), "old marked superseded");
+        assert!(
+            !s.get(&old_id).unwrap().unwrap().is_active(),
+            "old marked superseded"
+        );
     }
 
     #[test]
@@ -4054,9 +4090,12 @@ mod tests {
         old.embedding = Some(vec![1.0_f32; 384]);
         let old_id = s.store(old).unwrap();
         // threshold >= 1.0 disables supersession entirely (today's behavior).
-        let r = supersede_similar(&s, "profile", "x", &vec![1.0_f32; 384], 1.0).unwrap();
+        let r = supersede_similar(&s, "profile", &vec![1.0_f32; 384], 1.0).unwrap();
         assert!(r.is_none());
-        assert!(s.get(&old_id).unwrap().unwrap().is_active(), "old still active");
+        assert!(
+            s.get(&old_id).unwrap().unwrap().is_active(),
+            "old still active"
+        );
     }
 
     // === Embedding dimension guard (F-001) ===

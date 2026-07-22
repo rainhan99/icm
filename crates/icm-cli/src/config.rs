@@ -46,6 +46,10 @@ pub struct MemoryConfig {
     pub auto_consolidate_enabled: bool,
     /// Number of entries in a topic before auto-consolidation triggers.
     pub auto_consolidate_threshold: usize,
+    /// F-003 supersession: cosine-similarity threshold (0..1) above which
+    /// storing a near-duplicate marks the older same-topic memory as
+    /// superseded. `>= 1.0` disables supersession (default 0.90).
+    pub supersede_threshold: f32,
 }
 
 /// Embedding model settings.
@@ -276,6 +280,7 @@ impl Default for MemoryConfig {
             prune_threshold: 0.1,
             auto_consolidate_enabled: false,
             auto_consolidate_threshold: 10,
+            supersede_threshold: 0.90,
         }
     }
 }

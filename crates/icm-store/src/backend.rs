@@ -527,6 +527,9 @@ impl MemoryStore for Store {
     fn list_all(&self) -> IcmResult<Vec<Memory>> {
         dispatch!(self, list_all())
     }
+    fn list_all_including_superseded(&self) -> IcmResult<Vec<Memory>> {
+        dispatch!(self, list_all_including_superseded())
+    }
     fn get_by_topic(&self, topic: &str) -> IcmResult<Vec<Memory>> {
         dispatch!(self, get_by_topic(topic))
     }
