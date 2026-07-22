@@ -50,6 +50,28 @@ Well within the ≤ 8% gate.
   `CachingEmbedder` (disk + LRU) serves repeats with zero API cost — see
   `/cache` on the server for live hit-rate.
 
+## F-002 (code graph) — zero regression
+
+The `code-graph` feature (default-on) is additive: it creates `cg_*`
+tables at store init but does not touch the memory store's hot path. Bench
+after F-002 (`--release`, `--count 5000`), vs the F-001 archive above:
+
+| Operation | F-001 archive | F-002 | Δ |
+|---|---|---|---|
+| Store (no embeddings) | 24.1 µs/op | 23.3 µs/op | within noise |
+| Store (with embeddings) | 34.1 µs/op | 33.7 µs/op | within noise |
+| FTS5 search | 29.0 µs/op | 28.3 µs/op | within noise |
+| Vector search (KNN) | 1.1 ms/op | 1.1 ms/op | = |
+| Hybrid search | 1.2 ms/op | 1.2 ms/op | = |
+
+No regression. Stripping the feature
+(`--no-default-features --features backend-sqlite`) removes tree-sitter
+entirely.
+
+Code-graph indexing of ICM itself: 87 files, 2619 symbols, 21386 refs;
+`icm code explore` answers structural queries in one call (see
+`docs/code-graph.md`).
+
 ## How to re-run
 
 ```bash

@@ -53,6 +53,15 @@ model = "intfloat/multilingual-e5-base"
 # Repeated embeddings are cached (disk + in-memory LRU) under the platform
 # cache dir; view usage at http://<server>/cache when running `icm serve --http`.
 
+# --- Code graph (F-002, requires the default `code-graph` build feature) ---
+# The code graph indexes symbols + call edges (Rust/TS-JS/Python/Go) so
+# agents query dependencies from a pre-built index (icm_code_explore)
+# instead of grep/read — saving tokens. It has no config keys of its own
+# yet: build it with `icm code index`, and it shares the store selected by
+# `ICM_DB_BACKEND` (including `remote` for cross-machine sharing). The
+# PostToolUse hook marks edited files stale for `icm code index
+# --incremental`. See docs/code-graph.md.
+
 [extraction]
 # Layer 0: rule-based fact extraction (zero LLM cost)
 enabled = true
