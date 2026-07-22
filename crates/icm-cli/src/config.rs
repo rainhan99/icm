@@ -25,6 +25,7 @@ pub struct Config {
     pub web: WebConfig,
     pub cloud: CloudConfig,
     pub archive: ArchiveConfig,
+    pub remote: RemoteConfig,
 }
 
 /// Database storage settings.
@@ -270,6 +271,29 @@ impl Default for CloudConfig {
     }
 }
 
+/// Remote server (`icm serve --http`) settings (F-003 phase-1).
+///
+/// # ⚠️ Scaffold only — identity, NOT isolation
+///
+/// A non-empty [`tokens`](Self::tokens) map turns the HTTP server
+/// multi-tenant *aware*: it resolves each incoming `Authorization: Bearer
+/// <token>` to a tenant name and rejects unknown tokens with `401`. This
+/// resolves **identity only** — it does **NOT** isolate data between
+/// tenants. Every tenant still reads and writes the same shared store.
+/// Row-level tenant isolation (Postgres RLS) is deferred to F-003b. Do not
+/// deploy this as a security boundary between mutually distrusting tenants.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct RemoteConfig {
+    /// token → tenant map. Each entry maps an opaque Bearer token to a
+    /// tenant name. Empty (default) preserves F-001 single-token behavior
+    /// (one global `--token`, tenant reported as `"default"`).
+    ///
+    /// Tokens are secrets: they are never logged, echoed by `/whoami`, or
+    /// placed in error messages — only the resolved tenant is observable.
+    pub tokens: std::collections::HashMap<String, String>,
+}
+
 // --- Defaults ---
 
 impl Default for MemoryConfig {
@@ -377,6 +401,26 @@ mod tests {
         assert_eq!(config.memory.decay_rate, 0.95);
         assert_eq!(config.recall.limit, 15);
         assert!(config.mcp.compact);
+    }
+
+    #[test]
+    fn remote_tokens_parse() {
+        // F-003 T6: `[remote] tokens` maps opaque Bearer tokens to tenants.
+        let toml_str = r#"
+[remote]
+tokens = { tokA = "tenantA", tokB = "tenantB" }
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.remote.tokens.get("tokA").map(String::as_str),
+            Some("tenantA")
+        );
+        assert_eq!(
+            config.remote.tokens.get("tokB").map(String::as_str),
+            Some("tenantB")
+        );
+        // Default: empty map → F-001 single-token behavior preserved.
+        assert!(Config::default().remote.tokens.is_empty());
     }
 
     #[test]
