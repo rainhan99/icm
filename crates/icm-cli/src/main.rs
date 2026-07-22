@@ -353,6 +353,14 @@ enum Commands {
         command: MemoirCommands,
     },
 
+    /// Code graph (F-002): index a repo and query symbols/callers/impact
+    /// from a pre-built index instead of grep/read (token-saving).
+    #[cfg(feature = "code-graph")]
+    Code {
+        #[command(subcommand)]
+        command: code_index::CodeCommand,
+    },
+
     /// Configure ICM integration for Claude Code / Claude Desktop
     Init {
         /// Integration mode (default: standard = cli + skill + hook, no MCP).
@@ -1856,6 +1864,8 @@ fn main() -> Result<()> {
         } => cmd_extract_patterns(&store, &topic, memoir.as_deref(), min_cluster_size),
         Commands::Topics => cmd_topics(&store),
         Commands::Stats => cmd_stats(&store),
+        #[cfg(feature = "code-graph")]
+        Commands::Code { command } => code_index::run(&command, &store),
         Commands::ExtractPending {
             limit,
             provider,

@@ -9,11 +9,123 @@
 use std::path::Path;
 
 use anyhow::Result;
+use clap::Subcommand;
 use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
 
 use icm_core::{code_parse, code_resolve, CodeFile, CodeGraphStore, CodeLanguage, Ref, Symbol};
 use icm_store::Store;
+
+/// `icm code <...>` subcommands (F-002).
+#[derive(Subcommand, Debug)]
+pub enum CodeCommand {
+    /// Index (or re-index) a repository into the code graph.
+    Index {
+        /// Repository root to index (default: current directory).
+        #[arg(default_value = ".")]
+        path: String,
+        /// Only re-parse files whose content changed since last index.
+        #[arg(long)]
+        incremental: bool,
+    },
+    /// Explore a symbol: definition, callers, callees, blast radius.
+    Explore {
+        symbol: String,
+        #[arg(long, default_value = "3")]
+        depth: usize,
+    },
+    /// List the callers of a symbol.
+    Callers { symbol: String },
+    /// Show the transitive change blast-radius of a symbol.
+    Impact {
+        symbol: String,
+        #[arg(long, default_value = "5")]
+        depth: usize,
+    },
+    /// Show code-graph statistics.
+    Stats,
+}
+
+fn fmt_syms(syms: &[Symbol]) -> String {
+    if syms.is_empty() {
+        "(none)".to_string()
+    } else {
+        syms.iter()
+            .map(|s| format!("  {} — {}:{}", s.name, s.file, s.start_line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// Read the verbatim source of a symbol from disk (best-effort), relative
+/// to `root`. Returns `None` if the file can't be read.
+fn read_source(root: &Path, sym: &Symbol) -> Option<String> {
+    let text = std::fs::read_to_string(root.join(&sym.file)).ok()?;
+    let start = sym.start_line.saturating_sub(1) as usize;
+    let end = (sym.end_line as usize).min(text.lines().count());
+    Some(text.lines().skip(start).take(end - start).collect::<Vec<_>>().join("\n"))
+}
+
+/// Execute a `code` subcommand against `store` (root = current dir for
+/// source slicing).
+pub fn run(cmd: &CodeCommand, store: &Store) -> Result<()> {
+    let root = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    match cmd {
+        CodeCommand::Index { path, incremental } => {
+            let report = index_path(store, Path::new(path), *incremental)?;
+            println!(
+                "code graph: indexed {} file(s), {} symbol(s), skipped {}",
+                report.files_indexed, report.symbols, report.files_skipped
+            );
+        }
+        CodeCommand::Explore { symbol, depth } => match store.explore(symbol, *depth)? {
+            Some(res) => {
+                println!(
+                    "{:?} {} @ {}:{}-{}",
+                    res.symbol.kind, res.symbol.name, res.symbol.file, res.symbol.start_line, res.symbol.end_line
+                );
+                println!("\ncallers ({}):\n{}", res.callers.len(), fmt_syms(&res.callers));
+                println!("\ncallees ({}):\n{}", res.callees.len(), fmt_syms(&res.callees));
+                println!(
+                    "\nblast radius ({}):\n{}",
+                    res.blast_radius.len(),
+                    fmt_syms(&res.blast_radius)
+                );
+                if let Some(src) = read_source(&root, &res.symbol) {
+                    println!("\nsource:\n{src}");
+                }
+            }
+            None => println!("no symbol named {symbol:?} — run `icm code index` first"),
+        },
+        CodeCommand::Callers { symbol } => match store.find_symbols(symbol, 1)?.into_iter().next() {
+            Some(s) => {
+                let callers = store.callers(&s.id)?;
+                println!("callers of {} ({}):\n{}", s.name, callers.len(), fmt_syms(&callers));
+            }
+            None => println!("no symbol named {symbol:?}"),
+        },
+        CodeCommand::Impact { symbol, depth } => match store.explore(symbol, *depth)? {
+            Some(res) => println!(
+                "impact of {} — {} symbol(s):\n{}",
+                res.symbol.name,
+                res.blast_radius.len(),
+                fmt_syms(&res.blast_radius)
+            ),
+            None => println!("no symbol named {symbol:?}"),
+        },
+        CodeCommand::Stats => {
+            let s = store.code_stats()?;
+            println!(
+                "files: {}\nsymbols: {}\nrefs: {}\nstale: {}",
+                s.files, s.symbols, s.refs, s.stale_files
+            );
+            for (lang, n) in &s.by_language {
+                println!("  {lang}: {n}");
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Directories always skipped even if not `.gitignore`d (build artifacts,
 /// vendored deps) so indexing stays fast and relevant.
@@ -175,6 +287,28 @@ mod tests {
         // The call foo -> bar resolved to a real edge.
         let bar = store.find_symbols("bar", 5).unwrap().into_iter().next().unwrap();
         assert_eq!(store.callers(&bar.id).unwrap().len(), 1, "foo calls bar");
+    }
+
+    #[test]
+    fn code_cli_subcommands_run() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "fn foo(){ bar(); }\nfn bar(){}").unwrap();
+        let store = Store::in_memory().unwrap();
+        run(
+            &CodeCommand::Index {
+                path: dir.path().to_string_lossy().to_string(),
+                incremental: false,
+            },
+            &store,
+        )
+        .unwrap();
+        // Index populated the graph.
+        assert!(store.code_stats().unwrap().symbols >= 2);
+        // Every subcommand runs without error.
+        run(&CodeCommand::Stats, &store).unwrap();
+        run(&CodeCommand::Explore { symbol: "bar".into(), depth: 3 }, &store).unwrap();
+        run(&CodeCommand::Callers { symbol: "bar".into() }, &store).unwrap();
+        run(&CodeCommand::Impact { symbol: "bar".into(), depth: 5 }, &store).unwrap();
     }
 
     #[test]
