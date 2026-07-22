@@ -460,6 +460,8 @@ pub fn pull_memories(
                     .last_accessed
                     .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
                     .unwrap_or(now),
+                // Cloud-synced memories are active on import (F-003).
+                superseded_at: None,
             }
         })
         .collect();

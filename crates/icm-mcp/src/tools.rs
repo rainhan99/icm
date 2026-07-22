@@ -1100,6 +1100,7 @@ fn tool_store(
                 related_ids: existing.related_ids.clone(),
                 updated_at: Utc::now(),
                 scope: existing.scope,
+                superseded_at: existing.superseded_at,
             };
             if let Err(e) = store.update(&updated) {
                 return ToolResult::error(format!("failed to update: {e}"));

@@ -2292,6 +2292,7 @@ fn cmd_store(
                 source: existing.source,
                 related_ids: existing.related_ids,
                 scope: existing.scope,
+                superseded_at: existing.superseded_at,
             };
             store.update(&updated)?;
             println!(
