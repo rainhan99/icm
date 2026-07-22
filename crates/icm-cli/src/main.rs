@@ -14,6 +14,8 @@ mod install_manifest;
 #[cfg(test)]
 mod learn_tests;
 mod recall_format;
+#[cfg(feature = "remote-store")]
+mod rpc_dispatch;
 mod summarizer;
 #[cfg(feature = "tui")]
 mod tui;
