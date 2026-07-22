@@ -32,6 +32,9 @@ use crate::opensearch::OpenSearchStore;
 #[cfg(feature = "remote-store")]
 use crate::remote::RemoteHttpStore;
 
+#[cfg(feature = "code-graph")]
+use icm_core::{CodeFile, CodeGraphStore, CodeStats, ExploreResult, Ref, Symbol};
+
 /// Which storage backend is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
@@ -758,6 +761,61 @@ impl TranscriptStore for Store {
     }
 }
 
+// Code-graph dispatch (F-002). Unlike the blanket `dispatch!`, only the
+// SQLite (and, from T19, Remote) backends implement `CodeGraphStore`;
+// network-DB backends (postgres/opensearch) report `Unsupported` — the
+// code graph is a node-local/SQLite concern. `explore` forwards to the
+// active variant so the remote client's single-RPC override is honored.
+#[cfg(feature = "code-graph")]
+macro_rules! cg_forward {
+    ($self:expr, $m:ident ( $($a:expr),* )) => {
+        match $self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(s) => s.$m($($a),*),
+            // Remote arm is added in T19 once RemoteHttpStore implements
+            // CodeGraphStore; until then remote falls through to Unsupported.
+            #[allow(unreachable_patterns)]
+            _ => Err(IcmError::Unsupported(
+                concat!("code_graph.", stringify!($m)).to_string(),
+            )),
+        }
+    };
+}
+
+#[cfg(feature = "code-graph")]
+impl CodeGraphStore for Store {
+    fn index_file(&self, file: &CodeFile, symbols: &[Symbol], refs: &[Ref]) -> IcmResult<()> {
+        cg_forward!(self, index_file(file, symbols, refs))
+    }
+    fn delete_file(&self, path: &str) -> IcmResult<()> {
+        cg_forward!(self, delete_file(path))
+    }
+    fn file_hash(&self, path: &str) -> IcmResult<Option<String>> {
+        cg_forward!(self, file_hash(path))
+    }
+    fn get_symbol(&self, id: &str) -> IcmResult<Option<Symbol>> {
+        cg_forward!(self, get_symbol(id))
+    }
+    fn find_symbols(&self, name: &str, limit: usize) -> IcmResult<Vec<Symbol>> {
+        cg_forward!(self, find_symbols(name, limit))
+    }
+    fn callers(&self, symbol_id: &str) -> IcmResult<Vec<Symbol>> {
+        cg_forward!(self, callers(symbol_id))
+    }
+    fn callees(&self, symbol_id: &str) -> IcmResult<Vec<Symbol>> {
+        cg_forward!(self, callees(symbol_id))
+    }
+    fn explore(&self, name: &str, max_depth: usize) -> IcmResult<Option<ExploreResult>> {
+        cg_forward!(self, explore(name, max_depth))
+    }
+    fn list_stale(&self) -> IcmResult<Vec<String>> {
+        cg_forward!(self, list_stale())
+    }
+    fn code_stats(&self) -> IcmResult<CodeStats> {
+        cg_forward!(self, code_stats())
+    }
+}
+
 #[cfg(test)]
 mod backend_kind_tests {
     use super::BackendKind;
@@ -782,5 +840,19 @@ mod backend_kind_tests {
             BackendKind::Sqlite
         );
         assert!(BackendKind::parse(Some("bogus")).is_err());
+    }
+}
+
+#[cfg(all(test, feature = "code-graph"))]
+mod code_graph_dispatch_tests {
+    use super::Store;
+    use icm_core::CodeGraphStore;
+
+    #[test]
+    fn sqlite_store_code_stats_empty() {
+        let s = Store::in_memory().unwrap();
+        let st = s.code_stats().unwrap();
+        assert_eq!(st.symbols, 0);
+        assert_eq!(st.files, 0);
     }
 }
