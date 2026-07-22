@@ -152,6 +152,17 @@ pub const ALL_METHODS: &[&str] = &[
     "transcript.search_transcripts",
     "transcript.forget_session",
     "transcript.transcript_stats",
+    // --- CodeGraphStore (10, F-002) ---
+    "code.index_file",
+    "code.delete_file",
+    "code.file_hash",
+    "code.get_symbol",
+    "code.find_symbols",
+    "code.callers",
+    "code.callees",
+    "code.explore",
+    "code.list_stale",
+    "code.code_stats",
 ];
 
 /// True if `method` is a known store-RPC method (closed allow-list).

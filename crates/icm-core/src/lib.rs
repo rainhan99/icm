@@ -1,5 +1,7 @@
 pub mod auto_link;
 pub mod cache;
+#[cfg(feature = "code-graph")]
+pub mod code_graph;
 #[cfg(feature = "cloud-embeddings")]
 pub mod caching_embedder;
 pub mod context_snapshot;
@@ -28,6 +30,11 @@ pub const DEFAULT_EMBEDDING_DIMS: usize = 384;
 
 pub use auto_link::{add_backrefs, auto_link_memory, AutoLinkOptions};
 pub use cache::CacheMetrics;
+#[cfg(feature = "code-graph")]
+pub use code_graph::{
+    CodeFile, CodeGraphStore, CodeLanguage, CodeStats, ExploreResult, Ref, RefKind, Symbol,
+    SymbolKind,
+};
 #[cfg(feature = "cloud-embeddings")]
 pub use caching_embedder::CachingEmbedder;
 pub use context_snapshot::{
