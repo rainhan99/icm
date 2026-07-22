@@ -220,7 +220,7 @@ impl ConceptLink {
 // MemoirStats
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MemoirStats {
     pub total_concepts: usize,
     pub total_links: usize,

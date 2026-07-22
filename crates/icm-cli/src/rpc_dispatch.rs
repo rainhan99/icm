@@ -20,8 +20,8 @@ use serde::Serialize;
 use serde_json::Value;
 
 use icm_core::{
-    Embedder, FactsStore, Feedback, FeedbackStore, IcmError, IcmResult, Memory, MemoryStore,
-    RpcResponse,
+    Concept, ConceptLink, Embedder, FactsStore, Feedback, FeedbackStore, IcmError, IcmResult,
+    Label, Memoir, MemoirStore, Memory, MemoryStore, Relation, RpcResponse,
 };
 use icm_store::Store;
 
@@ -214,6 +214,107 @@ fn dispatch_inner(
         }
         "feedback.feedback_stats" => as_value(store.feedback_stats()?),
 
+        // --- MemoirStore: memoir CRUD ---
+        "memoir.create_memoir" => {
+            let m: Memoir = want_val(p, "memoir")?;
+            as_value(store.create_memoir(m)?)
+        }
+        "memoir.get_memoir" => as_value(store.get_memoir(&want_str(p, "id")?)?),
+        "memoir.get_memoir_by_name" => {
+            as_value(store.get_memoir_by_name(&want_str(p, "name")?)?)
+        }
+        "memoir.update_memoir" => {
+            let m: Memoir = want_val(p, "memoir")?;
+            store.update_memoir(&m)?;
+            Ok(Value::Null)
+        }
+        "memoir.delete_memoir" => {
+            store.delete_memoir(&want_str(p, "id")?)?;
+            Ok(Value::Null)
+        }
+        "memoir.list_memoirs" => as_value(store.list_memoirs()?),
+
+        // --- MemoirStore: concept CRUD ---
+        "memoir.add_concept" => {
+            let c: Concept = want_val(p, "concept")?;
+            as_value(store.add_concept(c)?)
+        }
+        "memoir.get_concept" => as_value(store.get_concept(&want_str(p, "id")?)?),
+        "memoir.get_concept_by_name" => as_value(
+            store.get_concept_by_name(&want_str(p, "memoir_id")?, &want_str(p, "name")?)?,
+        ),
+        "memoir.update_concept" => {
+            let c: Concept = want_val(p, "concept")?;
+            store.update_concept(&c)?;
+            Ok(Value::Null)
+        }
+        "memoir.delete_concept" => {
+            store.delete_concept(&want_str(p, "id")?)?;
+            Ok(Value::Null)
+        }
+
+        // --- MemoirStore: concept search ---
+        "memoir.list_concepts" => as_value(store.list_concepts(&want_str(p, "memoir_id")?)?),
+        "memoir.search_concepts_fts" => as_value(store.search_concepts_fts(
+            &want_str(p, "memoir_id")?,
+            &want_str(p, "query")?,
+            opt_usize(p, "limit", 10),
+        )?),
+        "memoir.search_concepts_by_label" => {
+            let memoir_id = want_str(p, "memoir_id")?;
+            let label: Label = want_val(p, "label")?;
+            as_value(store.search_concepts_by_label(&memoir_id, &label, opt_usize(p, "limit", 10))?)
+        }
+        "memoir.search_all_concepts_fts" => as_value(
+            store.search_all_concepts_fts(&want_str(p, "query")?, opt_usize(p, "limit", 10))?,
+        ),
+
+        // --- MemoirStore: refinement ---
+        "memoir.refine_concept" => {
+            let id = want_str(p, "id")?;
+            let def = want_str(p, "new_definition")?;
+            let sources: Vec<String> = want_val(p, "new_source_ids")?;
+            store.refine_concept(&id, &def, &sources)?;
+            Ok(Value::Null)
+        }
+
+        // --- MemoirStore: graph ---
+        "memoir.add_link" => {
+            let link: ConceptLink = want_val(p, "link")?;
+            as_value(store.add_link(link)?)
+        }
+        "memoir.get_links_from" => {
+            as_value(store.get_links_from(&want_str(p, "concept_id")?)?)
+        }
+        "memoir.get_links_to" => as_value(store.get_links_to(&want_str(p, "concept_id")?)?),
+        "memoir.delete_link" => {
+            store.delete_link(&want_str(p, "id")?)?;
+            Ok(Value::Null)
+        }
+        "memoir.get_neighbors" => {
+            let concept_id = want_str(p, "concept_id")?;
+            let relation: Option<Relation> = match p.get("relation") {
+                Some(Value::Null) | None => None,
+                Some(v) => Some(
+                    serde_json::from_value(v.clone())
+                        .map_err(|e| IcmError::InvalidInput(format!("bad param 'relation': {e}")))?,
+                ),
+            };
+            as_value(store.get_neighbors(&concept_id, relation)?)
+        }
+        "memoir.get_neighborhood" => as_value(
+            store.get_neighborhood(&want_str(p, "concept_id")?, opt_usize(p, "depth", 1))?,
+        ),
+        "memoir.get_links_for_memoir" => {
+            as_value(store.get_links_for_memoir(&want_str(p, "memoir_id")?)?)
+        }
+
+        // --- MemoirStore: stats ---
+        "memoir.memoir_stats" => as_value(store.memoir_stats(&want_str(p, "memoir_id")?)?),
+        "memoir.batch_memoir_concept_counts" => {
+            as_value(store.batch_memoir_concept_counts()?)
+        }
+
         other => Err(IcmError::InvalidInput(format!(
             "unknown store-RPC method: {other}"
         ))),
@@ -266,6 +367,29 @@ mod tests {
         let stats = dispatch(&store, None, "feedback.feedback_stats", json!({}));
         assert!(stats.error.is_none());
         assert!(stats.result.unwrap().is_object());
+    }
+
+    #[test]
+    fn memoir_roundtrip() {
+        let store = Store::in_memory().unwrap();
+        // create_memoir → get_memoir returns it.
+        let m = Memoir::new("proj".to_string(), "a project".to_string());
+        let created = dispatch(&store, None, "memoir.create_memoir", json!({ "memoir": m }));
+        let memoir_id = created.result.unwrap().as_str().unwrap().to_string();
+        assert!(!memoir_id.is_empty());
+
+        // add_concept then list_concepts shows it.
+        let c = Concept::new(memoir_id.clone(), "widget".to_string(), "a thing".to_string());
+        let added = dispatch(&store, None, "memoir.add_concept", json!({ "concept": c }));
+        assert!(added.error.is_none(), "add_concept: {:?}", added.error);
+        let listed = dispatch(
+            &store,
+            None,
+            "memoir.list_concepts",
+            json!({ "memoir_id": memoir_id }),
+        );
+        let arr = listed.result.unwrap();
+        assert_eq!(arr.as_array().unwrap().len(), 1);
     }
 
     #[test]
