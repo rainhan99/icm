@@ -47,10 +47,21 @@ pub fn init_code_graph(conn: &Connection) -> IcmResult<()> {
         CREATE INDEX IF NOT EXISTS idx_cg_refs_target ON cg_refs(target_symbol);
         CREATE INDEX IF NOT EXISTS idx_cg_refs_name ON cg_refs(target_name);
 
+        -- External-content FTS over cg_symbols.name (mirrors the memories
+        -- FTS pattern): triggers keep it in sync so a plain
+        -- `DELETE FROM cg_symbols WHERE file=?` on re-index cascades here.
         CREATE VIRTUAL TABLE IF NOT EXISTS cg_symbols_fts USING fts5(
             name,
-            symbol_id UNINDEXED
+            content='cg_symbols',
+            content_rowid='rowid'
         );
+        CREATE TRIGGER IF NOT EXISTS cg_symbols_ai AFTER INSERT ON cg_symbols BEGIN
+            INSERT INTO cg_symbols_fts(rowid, name) VALUES (new.rowid, new.name);
+        END;
+        CREATE TRIGGER IF NOT EXISTS cg_symbols_ad AFTER DELETE ON cg_symbols BEGIN
+            INSERT INTO cg_symbols_fts(cg_symbols_fts, rowid, name)
+            VALUES ('delete', old.rowid, old.name);
+        END;
         ",
     )
     .map_err(|e| IcmError::Database(format!("code-graph schema init: {e}")))

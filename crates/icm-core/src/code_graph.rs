@@ -170,9 +170,44 @@ pub trait CodeGraphStore {
     fn callees(&self, symbol_id: &str) -> IcmResult<Vec<Symbol>>;
 
     /// Single-call structural answer for the best match of `name`,
-    /// computing blast radius up to `max_depth` (server-side in remote
-    /// mode, avoiding client BFS round-trips).
-    fn explore(&self, name: &str, max_depth: usize) -> IcmResult<Option<ExploreResult>>;
+    /// computing blast radius up to `max_depth`. Default implementation
+    /// does a local BFS over callers — correct for the SQLite backend.
+    /// The remote client OVERRIDES this with one server-side RPC so a
+    /// thin client never does BFS across the network.
+    ///
+    /// `source` is left `None` here (the store has no file access); the
+    /// CLI/MCP layer fills it from disk.
+    fn explore(&self, name: &str, max_depth: usize) -> IcmResult<Option<ExploreResult>> {
+        let Some(symbol) = self.find_symbols(name, 1)?.into_iter().next() else {
+            return Ok(None);
+        };
+        let callers = self.callers(&symbol.id)?;
+        let callees = self.callees(&symbol.id)?;
+        // Bounded BFS over transitive callers for the blast radius.
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(symbol.id.clone());
+        let mut blast: Vec<Symbol> = Vec::new();
+        let mut frontier: Vec<Symbol> = callers.clone();
+        let mut depth = 0;
+        while !frontier.is_empty() && depth < max_depth {
+            let mut next = Vec::new();
+            for s in frontier.drain(..) {
+                if seen.insert(s.id.clone()) {
+                    next.extend(self.callers(&s.id)?);
+                    blast.push(s);
+                }
+            }
+            frontier = next;
+            depth += 1;
+        }
+        Ok(Some(ExploreResult {
+            symbol,
+            source: None,
+            callers,
+            callees,
+            blast_radius: blast,
+        }))
+    }
 
     /// Paths currently flagged stale (edited but not re-indexed).
     fn list_stale(&self) -> IcmResult<Vec<String>>;

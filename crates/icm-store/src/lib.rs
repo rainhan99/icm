@@ -30,6 +30,8 @@ compile_error!(
 mod backend;
 #[cfg(all(feature = "code-graph", feature = "backend-sqlite"))]
 mod code_graph_schema;
+#[cfg(all(feature = "code-graph", feature = "backend-sqlite"))]
+mod code_graph_store;
 mod common;
 
 #[cfg(feature = "backend-sqlite")]

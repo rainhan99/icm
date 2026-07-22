@@ -107,6 +107,14 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
+    /// Borrow the underlying connection for the code-graph store impl
+    /// (sibling module `code_graph_store`, F-002). Same-crate accessor
+    /// since the `conn` field is module-private.
+    #[cfg(feature = "code-graph")]
+    pub(crate) fn cg_conn(&self) -> &Connection {
+        &self.conn
+    }
+
     /// Reject an embedding whose length disagrees with the store's
     /// declared dimensionality. No-op when `dims == 0` (unknown) or the
     /// memory carries no embedding.
