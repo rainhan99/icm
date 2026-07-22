@@ -34,6 +34,25 @@ prune_threshold = 0.1
 #   "jinaai/jina-embeddings-v2-base-code" — 768d, code-optimized
 model = "intfloat/multilingual-e5-base"
 
+# --- Cloud embeddings (F-001, requires the `cloud-embeddings` build feature) ---
+# provider selects where embeddings are computed:
+#   "local"  (default) — on-device fastembed model above
+#   "openai"           — any OpenAI-compatible /embeddings endpoint
+# provider = "openai"
+#
+# For provider = "openai":
+#   - `model` above becomes the cloud model name, e.g. "text-embedding-3-small"
+#   - base_url is the API root (up to /v1); /embeddings is appended
+#   - dimensions is the model's output size (must match the store's dim;
+#     switching dims requires `icm embed --force` to re-embed)
+#   - the API key comes from env ICM_EMBED_API_KEY (falls back to OPENAI_API_KEY),
+#     never from this file, and is never logged
+# base_url = "https://api.openai.com/v1"
+# dimensions = 1536
+#
+# Repeated embeddings are cached (disk + in-memory LRU) under the platform
+# cache dir; view usage at http://<server>/cache when running `icm serve --http`.
+
 [extraction]
 # Layer 0: rule-based fact extraction (zero LLM cost)
 enabled = true
