@@ -120,7 +120,8 @@ mod tests {
 
     #[test]
     fn rust_extracts_call_edge() {
-        let parsed = parse_file(CodeLanguage::Rust, "a.rs", "fn a(){ b(); }\nfn b(){}").expect("parse");
+        let parsed =
+            parse_file(CodeLanguage::Rust, "a.rs", "fn a(){ b(); }\nfn b(){}").expect("parse");
         let a = parsed.symbols.iter().find(|s| s.name == "a").unwrap();
         let call = parsed
             .refs
@@ -134,7 +135,8 @@ mod tests {
 
     #[test]
     fn go_extracts_func_method_struct_interface() {
-        let src = "package p\nfunc Foo(){}\nfunc (r R) Bar(){}\ntype Baz struct{}\ntype Q interface{}\n";
+        let src =
+            "package p\nfunc Foo(){}\nfunc (r R) Bar(){}\ntype Baz struct{}\ntype Q interface{}\n";
         let parsed = parse_file(CodeLanguage::Go, "a.go", src).expect("parse");
         let get = |n: &str| parsed.symbols.iter().find(|s| s.name == n).map(|s| s.kind);
         assert_eq!(get("Foo"), Some(SymbolKind::Function));
@@ -155,10 +157,18 @@ mod tests {
 
     #[test]
     fn javascript_arrow_const_is_function() {
-        let parsed = parse_file(CodeLanguage::JavaScript, "src/a.js", "const foo = () => {};")
-            .expect("parse");
+        let parsed = parse_file(
+            CodeLanguage::JavaScript,
+            "src/a.js",
+            "const foo = () => {};",
+        )
+        .expect("parse");
         assert_eq!(
-            parsed.symbols.iter().find(|s| s.name == "foo").map(|s| s.kind),
+            parsed
+                .symbols
+                .iter()
+                .find(|s| s.name == "foo")
+                .map(|s| s.kind),
             Some(SymbolKind::Function)
         );
     }

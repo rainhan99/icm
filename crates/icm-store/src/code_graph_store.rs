@@ -87,7 +87,11 @@ fn row_to_symbol(row: &rusqlite::Row) -> rusqlite::Result<Symbol> {
     })
 }
 
-fn query_symbols(conn: &Connection, sql: &str, args: &[&dyn rusqlite::ToSql]) -> IcmResult<Vec<Symbol>> {
+fn query_symbols(
+    conn: &Connection,
+    sql: &str,
+    args: &[&dyn rusqlite::ToSql],
+) -> IcmResult<Vec<Symbol>> {
     let mut stmt = conn.prepare(sql).map_err(db_err)?;
     let rows = stmt
         .query_map(args, row_to_symbol)
@@ -186,7 +190,9 @@ impl CodeGraphStore for SqliteStore {
 
     fn get_symbol(&self, id: &str) -> IcmResult<Option<Symbol>> {
         let sql = format!("SELECT {SYM_COLS} FROM cg_symbols WHERE id = ?1");
-        Ok(query_symbols(self.cg_conn(), &sql, &[&id])?.into_iter().next())
+        Ok(query_symbols(self.cg_conn(), &sql, &[&id])?
+            .into_iter()
+            .next())
     }
 
     fn find_symbols(&self, name: &str, limit: usize) -> IcmResult<Vec<Symbol>> {
@@ -196,7 +202,11 @@ impl CodeGraphStore for SqliteStore {
              JOIN cg_symbols_fts f ON s.rowid = f.rowid
              WHERE cg_symbols_fts MATCH ?1
              LIMIT ?2",
-            SYM_COLS.split(", ").map(|c| format!("s.{c}")).collect::<Vec<_>>().join(", ")
+            SYM_COLS
+                .split(", ")
+                .map(|c| format!("s.{c}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         // Quote the term so punctuation/keywords are treated literally.
         let term = format!("\"{}\"", name.replace('"', "\"\""));
@@ -208,7 +218,11 @@ impl CodeGraphStore for SqliteStore {
             "SELECT DISTINCT {} FROM cg_symbols s
              JOIN cg_refs r ON r.from_symbol = s.id
              WHERE r.target_symbol = ?1",
-            SYM_COLS.split(", ").map(|c| format!("s.{c}")).collect::<Vec<_>>().join(", ")
+            SYM_COLS
+                .split(", ")
+                .map(|c| format!("s.{c}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         query_symbols(self.cg_conn(), &sql, &[&symbol_id])
     }
@@ -218,7 +232,11 @@ impl CodeGraphStore for SqliteStore {
             "SELECT DISTINCT {} FROM cg_symbols s
              JOIN cg_refs r ON r.target_symbol = s.id
              WHERE r.from_symbol = ?1",
-            SYM_COLS.split(", ").map(|c| format!("s.{c}")).collect::<Vec<_>>().join(", ")
+            SYM_COLS
+                .split(", ")
+                .map(|c| format!("s.{c}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         query_symbols(self.cg_conn(), &sql, &[&symbol_id])
     }
@@ -260,7 +278,9 @@ impl CodeGraphStore for SqliteStore {
             .prepare("SELECT language, COUNT(*) FROM cg_symbols GROUP BY language ORDER BY 2 DESC")
             .map_err(db_err)?;
         let by_language = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize)))
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+            })
             .map_err(db_err)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(db_err)?;
@@ -313,7 +333,8 @@ mod tests {
             content_hash: "h1".into(),
             stale: false,
         };
-        s.index_file(&file, &[a.clone(), b.clone()], &[call]).unwrap();
+        s.index_file(&file, &[a.clone(), b.clone()], &[call])
+            .unwrap();
 
         assert_eq!(s.get_symbol(&a.id).unwrap().unwrap().name, "a");
         assert_eq!(s.file_hash("a.rs").unwrap().as_deref(), Some("h1"));
@@ -342,16 +363,27 @@ mod tests {
             content_hash: "h1".into(),
             stale: false,
         };
-        s.index_file(&file, &[sym("a.rs#a@1", "a", SymbolKind::Function, "a.rs", 1)], &[])
-            .unwrap();
+        s.index_file(
+            &file,
+            &[sym("a.rs#a@1", "a", SymbolKind::Function, "a.rs", 1)],
+            &[],
+        )
+        .unwrap();
         // Re-index same file with a different symbol set.
         let file2 = CodeFile {
             content_hash: "h2".into(),
             ..file.clone()
         };
-        s.index_file(&file2, &[sym("a.rs#z@1", "z", SymbolKind::Function, "a.rs", 1)], &[])
-            .unwrap();
-        assert!(s.find_symbols("a", 5).unwrap().is_empty(), "old symbol gone");
+        s.index_file(
+            &file2,
+            &[sym("a.rs#z@1", "z", SymbolKind::Function, "a.rs", 1)],
+            &[],
+        )
+        .unwrap();
+        assert!(
+            s.find_symbols("a", 5).unwrap().is_empty(),
+            "old symbol gone"
+        );
         assert_eq!(s.find_symbols("z", 5).unwrap().len(), 1);
         assert_eq!(s.file_hash("a.rs").unwrap().as_deref(), Some("h2"));
         assert_eq!(s.code_stats().unwrap().symbols, 1);
@@ -386,9 +418,18 @@ mod tests {
         let s = chain_store();
         let res = s.explore("c", 5).unwrap().expect("c found");
         assert_eq!(res.symbol.name, "c");
-        assert!(res.source.is_none(), "store-level explore leaves source to CLI/MCP");
+        assert!(
+            res.source.is_none(),
+            "store-level explore leaves source to CLI/MCP"
+        );
         // c is called directly by b.
-        assert_eq!(res.callers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["b"]);
+        assert_eq!(
+            res.callers
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b"]
+        );
         assert!(res.callees.is_empty());
         // Transitive callers of c: b (depth 1) and a (depth 2).
         let mut blast: Vec<_> = res.blast_radius.iter().map(|s| s.name.clone()).collect();
@@ -420,8 +461,12 @@ mod tests {
             content_hash: "h1".into(),
             stale: false,
         };
-        s.index_file(&file, &[sym("a.rs#a@1", "a", SymbolKind::Function, "a.rs", 1)], &[])
-            .unwrap();
+        s.index_file(
+            &file,
+            &[sym("a.rs#a@1", "a", SymbolKind::Function, "a.rs", 1)],
+            &[],
+        )
+        .unwrap();
         s.delete_file("a.rs").unwrap();
         assert!(s.find_symbols("a", 5).unwrap().is_empty());
         assert_eq!(s.code_stats().unwrap().files, 0);

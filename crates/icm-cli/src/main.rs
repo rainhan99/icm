@@ -1,9 +1,9 @@
 mod archive;
 mod bench_data;
-#[cfg(feature = "code-graph")]
-mod code_index;
 mod bench_format;
 mod bench_knowledge;
+#[cfg(feature = "code-graph")]
+mod code_index;
 
 pub mod cloud;
 mod config;

@@ -71,11 +71,24 @@ fn walk(
                 if decl.kind() == "variable_declarator" {
                     let is_fn = decl
                         .child_by_field_name("value")
-                        .map(|v| matches!(v.kind(), "arrow_function" | "function" | "function_expression"))
+                        .map(|v| {
+                            matches!(
+                                v.kind(),
+                                "arrow_function" | "function" | "function_expression"
+                            )
+                        })
                         .unwrap_or(false);
                     if is_fn {
                         if let Some(name) = field_text(&decl, "name", source) {
-                            push_symbol(&decl, name, SymbolKind::Function, path, language, &parent, out);
+                            push_symbol(
+                                &decl,
+                                name,
+                                SymbolKind::Function,
+                                path,
+                                language,
+                                &parent,
+                                out,
+                            );
                         }
                     }
                 }

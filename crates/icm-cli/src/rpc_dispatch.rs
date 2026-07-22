@@ -524,7 +524,13 @@ mod tests {
             end_line: 1,
             parent: None,
         };
-        let b = Symbol { id: "f#b@2".into(), name: "b".into(), start_line: 2, end_line: 2, ..a.clone() };
+        let b = Symbol {
+            id: "f#b@2".into(),
+            name: "b".into(),
+            start_line: 2,
+            end_line: 2,
+            ..a.clone()
+        };
         let call = Ref {
             from_symbol: a.id.clone(),
             target_name: "b".into(),

@@ -724,7 +724,10 @@ impl CodeGraphStore for RemoteHttpStore {
         self.call_de("code.callees", json!({ "symbol_id": symbol_id }))
     }
     fn explore(&self, name: &str, max_depth: usize) -> IcmResult<Option<ExploreResult>> {
-        self.call_de("code.explore", json!({ "name": name, "max_depth": max_depth }))
+        self.call_de(
+            "code.explore",
+            json!({ "name": name, "max_depth": max_depth }),
+        )
     }
     fn list_stale(&self) -> IcmResult<Vec<String>> {
         self.call_de("code.list_stale", json!({}))

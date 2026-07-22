@@ -26,8 +26,7 @@ pub fn resolve_refs(all_symbols: &[Symbol], refs: &mut [Ref]) {
     for s in all_symbols {
         by_name.entry(s.name.as_str()).or_default().push(s);
     }
-    let by_id: HashMap<&str, &Symbol> =
-        all_symbols.iter().map(|s| (s.id.as_str(), s)).collect();
+    let by_id: HashMap<&str, &Symbol> = all_symbols.iter().map(|s| (s.id.as_str(), s)).collect();
 
     for r in refs.iter_mut() {
         let Some(cands) = by_name.get(r.target_name.as_str()) else {
@@ -69,8 +68,8 @@ pub fn resolve_refs(all_symbols: &[Symbol], refs: &mut [Ref]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::code_parse::parse_file;
     use crate::code_graph::CodeLanguage;
+    use crate::code_parse::parse_file;
 
     #[test]
     fn cross_file_call_resolves_to_unique_definition() {
@@ -80,7 +79,13 @@ mod tests {
         all.extend(b.symbols.clone());
         let mut refs = a.refs.clone();
         resolve_refs(&all, &mut refs);
-        let helper_id = b.symbols.iter().find(|s| s.name == "helper").unwrap().id.clone();
+        let helper_id = b
+            .symbols
+            .iter()
+            .find(|s| s.name == "helper")
+            .unwrap()
+            .id
+            .clone();
         let call = refs.iter().find(|r| r.target_name == "helper").unwrap();
         assert_eq!(call.target_symbol.as_deref(), Some(helper_id.as_str()));
     }

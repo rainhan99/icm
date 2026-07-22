@@ -63,7 +63,13 @@ fn read_source(root: &Path, sym: &Symbol) -> Option<String> {
     let text = std::fs::read_to_string(root.join(&sym.file)).ok()?;
     let start = sym.start_line.saturating_sub(1) as usize;
     let end = (sym.end_line as usize).min(text.lines().count());
-    Some(text.lines().skip(start).take(end - start).collect::<Vec<_>>().join("\n"))
+    Some(
+        text.lines()
+            .skip(start)
+            .take(end - start)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
 /// Execute a `code` subcommand against `store` (root = current dir for
@@ -82,10 +88,22 @@ pub fn run(cmd: &CodeCommand, store: &Store) -> Result<()> {
             Some(res) => {
                 println!(
                     "{:?} {} @ {}:{}-{}",
-                    res.symbol.kind, res.symbol.name, res.symbol.file, res.symbol.start_line, res.symbol.end_line
+                    res.symbol.kind,
+                    res.symbol.name,
+                    res.symbol.file,
+                    res.symbol.start_line,
+                    res.symbol.end_line
                 );
-                println!("\ncallers ({}):\n{}", res.callers.len(), fmt_syms(&res.callers));
-                println!("\ncallees ({}):\n{}", res.callees.len(), fmt_syms(&res.callees));
+                println!(
+                    "\ncallers ({}):\n{}",
+                    res.callers.len(),
+                    fmt_syms(&res.callers)
+                );
+                println!(
+                    "\ncallees ({}):\n{}",
+                    res.callees.len(),
+                    fmt_syms(&res.callees)
+                );
                 println!(
                     "\nblast radius ({}):\n{}",
                     res.blast_radius.len(),
@@ -97,13 +115,20 @@ pub fn run(cmd: &CodeCommand, store: &Store) -> Result<()> {
             }
             None => println!("no symbol named {symbol:?} — run `icm code index` first"),
         },
-        CodeCommand::Callers { symbol } => match store.find_symbols(symbol, 1)?.into_iter().next() {
-            Some(s) => {
-                let callers = store.callers(&s.id)?;
-                println!("callers of {} ({}):\n{}", s.name, callers.len(), fmt_syms(&callers));
+        CodeCommand::Callers { symbol } => {
+            match store.find_symbols(symbol, 1)?.into_iter().next() {
+                Some(s) => {
+                    let callers = store.callers(&s.id)?;
+                    println!(
+                        "callers of {} ({}):\n{}",
+                        s.name,
+                        callers.len(),
+                        fmt_syms(&callers)
+                    );
+                }
+                None => println!("no symbol named {symbol:?}"),
             }
-            None => println!("no symbol named {symbol:?}"),
-        },
+        }
         CodeCommand::Impact { symbol, depth } => match store.explore(symbol, *depth)? {
             Some(res) => println!(
                 "impact of {} — {} symbol(s):\n{}",
@@ -188,9 +213,10 @@ pub fn index_path(store: &Store, root: &Path, incremental: bool) -> Result<Index
             continue;
         }
         let path = entry.path();
-        if path.components().any(|c| {
-            EXCLUDED_DIRS.contains(&c.as_os_str().to_string_lossy().as_ref())
-        }) {
+        if path
+            .components()
+            .any(|c| EXCLUDED_DIRS.contains(&c.as_os_str().to_string_lossy().as_ref()))
+        {
             continue;
         }
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -277,15 +303,30 @@ mod tests {
         let store = Store::in_memory().unwrap();
         let report = index_path(&store, root, false).unwrap();
 
-        assert!(report.symbols >= 2, "indexed foo + bar, got {}", report.symbols);
+        assert!(
+            report.symbols >= 2,
+            "indexed foo + bar, got {}",
+            report.symbols
+        );
         assert_eq!(store.find_symbols("foo", 5).unwrap().len(), 1);
         assert_eq!(store.find_symbols("bar", 5).unwrap().len(), 1);
         // node_modules excluded, .gitignore'd file excluded.
-        assert!(store.find_symbols("nope", 5).unwrap().is_empty(), "node_modules excluded");
-        assert!(store.find_symbols("secret", 5).unwrap().is_empty(), "gitignore excluded");
+        assert!(
+            store.find_symbols("nope", 5).unwrap().is_empty(),
+            "node_modules excluded"
+        );
+        assert!(
+            store.find_symbols("secret", 5).unwrap().is_empty(),
+            "gitignore excluded"
+        );
 
         // The call foo -> bar resolved to a real edge.
-        let bar = store.find_symbols("bar", 5).unwrap().into_iter().next().unwrap();
+        let bar = store
+            .find_symbols("bar", 5)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
         assert_eq!(store.callers(&bar.id).unwrap().len(), 1, "foo calls bar");
     }
 
@@ -306,9 +347,29 @@ mod tests {
         assert!(store.code_stats().unwrap().symbols >= 2);
         // Every subcommand runs without error.
         run(&CodeCommand::Stats, &store).unwrap();
-        run(&CodeCommand::Explore { symbol: "bar".into(), depth: 3 }, &store).unwrap();
-        run(&CodeCommand::Callers { symbol: "bar".into() }, &store).unwrap();
-        run(&CodeCommand::Impact { symbol: "bar".into(), depth: 5 }, &store).unwrap();
+        run(
+            &CodeCommand::Explore {
+                symbol: "bar".into(),
+                depth: 3,
+            },
+            &store,
+        )
+        .unwrap();
+        run(
+            &CodeCommand::Callers {
+                symbol: "bar".into(),
+            },
+            &store,
+        )
+        .unwrap();
+        run(
+            &CodeCommand::Impact {
+                symbol: "bar".into(),
+                depth: 5,
+            },
+            &store,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -329,10 +390,16 @@ mod tests {
         assert_eq!(report.files_indexed, 1, "only a.rs re-stored");
         assert_eq!(report.files_skipped, 1, "b.rs unchanged, skipped");
         // a.rs symbols updated; b.rs untouched.
-        assert!(store.find_symbols("foo", 5).unwrap().is_empty(), "old foo gone");
+        assert!(
+            store.find_symbols("foo", 5).unwrap().is_empty(),
+            "old foo gone"
+        );
         assert_eq!(store.find_symbols("qux", 5).unwrap().len(), 1);
         assert_eq!(store.find_symbols("keep", 5).unwrap().len(), 1);
         // Re-index cleared a.rs's stale flag.
-        assert!(store.list_stale().unwrap().is_empty(), "stale cleared after reindex");
+        assert!(
+            store.list_stale().unwrap().is_empty(),
+            "stale cleared after reindex"
+        );
     }
 }

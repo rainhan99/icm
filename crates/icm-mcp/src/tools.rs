@@ -788,10 +788,7 @@ fn tool_code_explore(store: &Store, args: &Value) -> ToolResult {
     let Some(symbol) = args.get("symbol").and_then(|v| v.as_str()) else {
         return ToolResult::error("missing required arg: symbol".to_string());
     };
-    let depth = args
-        .get("max_depth")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(3) as usize;
+    let depth = args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
     let names = |syms: &[icm_core::Symbol]| -> String {
         if syms.is_empty() {
             "(none)".to_string()
@@ -812,8 +809,16 @@ fn tool_code_explore(store: &Store, args: &Value) -> ToolResult {
                 res.symbol.start_line,
                 res.symbol.end_line
             );
-            out.push_str(&format!("callers ({}): {}\n", res.callers.len(), names(&res.callers)));
-            out.push_str(&format!("callees ({}): {}\n", res.callees.len(), names(&res.callees)));
+            out.push_str(&format!(
+                "callers ({}): {}\n",
+                res.callers.len(),
+                names(&res.callers)
+            ));
+            out.push_str(&format!(
+                "callees ({}): {}\n",
+                res.callees.len(),
+                names(&res.callees)
+            ));
             out.push_str(&format!(
                 "blast radius ({}): {}\n",
                 res.blast_radius.len(),
@@ -2452,14 +2457,26 @@ mod tests {
         };
         store.index_file(&file, &[a, b], &[call]).unwrap();
 
-        let result = call_tool(&store, None, "icm_code_explore", &json!({"symbol": "b"}), false);
+        let result = call_tool(
+            &store,
+            None,
+            "icm_code_explore",
+            &json!({"symbol": "b"}),
+            false,
+        );
         assert!(!result.is_error, "explore ok");
         let text = &result.content[0].text;
         assert!(text.contains("b @ f.rs"), "def line: {text}");
         assert!(text.contains("callers (1)"), "b has caller a: {text}");
 
         // Missing symbol → friendly message, not an error.
-        let miss = call_tool(&store, None, "icm_code_explore", &json!({"symbol": "zzz"}), false);
+        let miss = call_tool(
+            &store,
+            None,
+            "icm_code_explore",
+            &json!({"symbol": "zzz"}),
+            false,
+        );
         assert!(miss.content[0].text.contains("no symbol"));
     }
 

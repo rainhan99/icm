@@ -36,7 +36,14 @@ fn classify(kind: &str, in_impl: bool) -> Option<SymbolKind> {
     })
 }
 
-fn walk(node: Node, source: &str, path: &str, parent: Option<String>, in_impl: bool, out: &mut Vec<Symbol>) {
+fn walk(
+    node: Node,
+    source: &str,
+    path: &str,
+    parent: Option<String>,
+    in_impl: bool,
+    out: &mut Vec<Symbol>,
+) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         let kind_str = child.kind();
