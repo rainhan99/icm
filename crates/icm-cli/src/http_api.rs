@@ -817,13 +817,20 @@ mod rpc_tests {
         // Missing token → 401.
         let unauth = app
             .clone()
-            .oneshot(rpc_request(None, r#"{"method":"memory.count","params":{}}"#))
+            .oneshot(rpc_request(
+                None,
+                r#"{"method":"memory.count","params":{}}"#,
+            ))
             .await
             .unwrap();
         assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
 
         // Store a memory.
-        let m = Memory::new("t".to_string(), "hello world".to_string(), Importance::Medium);
+        let m = Memory::new(
+            "t".to_string(),
+            "hello world".to_string(),
+            Importance::Medium,
+        );
         let store_body =
             serde_json::json!({"method":"memory.store","params":{"memory": m}}).to_string();
         let stored = app
@@ -836,7 +843,10 @@ mod rpc_tests {
         // Count → 1.
         let counted = app
             .clone()
-            .oneshot(rpc_request(Some("secret"), r#"{"method":"memory.count","params":{}}"#))
+            .oneshot(rpc_request(
+                Some("secret"),
+                r#"{"method":"memory.count","params":{}}"#,
+            ))
             .await
             .unwrap();
         let v = body_json(counted).await;
@@ -845,7 +855,10 @@ mod rpc_tests {
         // Unknown method → error field, still HTTP 200.
         let bogus = app
             .clone()
-            .oneshot(rpc_request(Some("secret"), r#"{"method":"nope.x","params":{}}"#))
+            .oneshot(rpc_request(
+                Some("secret"),
+                r#"{"method":"nope.x","params":{}}"#,
+            ))
             .await
             .unwrap();
         let bv = body_json(bogus).await;

@@ -768,7 +768,10 @@ mod backend_kind_tests {
             BackendKind::parse(Some("remote")).unwrap(),
             BackendKind::Remote
         );
-        assert_eq!(BackendKind::parse(Some("http")).unwrap(), BackendKind::Remote);
+        assert_eq!(
+            BackendKind::parse(Some("http")).unwrap(),
+            BackendKind::Remote
+        );
     }
 
     #[test]

@@ -1513,7 +1513,8 @@ fn build_openai_embedder(base_url: &str, model: &str, dims: usize) -> BuiltEmbed
     let base = icm_core::OpenAiEmbedder::new(base_url, &key, model, dims);
     // Wrap in the caching decorator so repeated embeds skip the paid API
     // and populate the `/cache` metrics.
-    let caching = icm_core::CachingEmbedder::with_dir(Box::new(base), model, 4096, &embed_cache_dir());
+    let caching =
+        icm_core::CachingEmbedder::with_dir(Box::new(base), model, 4096, &embed_cache_dir());
     let metrics = caching.metrics();
     (Some(Box::new(caching)), Some(metrics))
 }
@@ -1561,10 +1562,18 @@ mod embedder_kind_tests {
     fn remote_mode_disables_local_embedder() {
         use icm_store::BackendKind;
         // Remote client: never load a local model, even if config enables it.
-        assert!(!compute_embeddings_enabled(true, false, BackendKind::Remote));
+        assert!(!compute_embeddings_enabled(
+            true,
+            false,
+            BackendKind::Remote
+        ));
         // Local backends keep the normal behavior.
         assert!(compute_embeddings_enabled(true, false, BackendKind::Sqlite));
-        assert!(!compute_embeddings_enabled(false, false, BackendKind::Sqlite));
+        assert!(!compute_embeddings_enabled(
+            false,
+            false,
+            BackendKind::Sqlite
+        ));
         assert!(!compute_embeddings_enabled(true, true, BackendKind::Sqlite));
     }
 }
@@ -1590,11 +1599,9 @@ fn main() -> Result<()> {
     // central server owns embedding, keeping the client zero-model.
     let active_backend =
         icm_store::BackendKind::from_env().unwrap_or(icm_store::BackendKind::Sqlite);
-    let embeddings_enabled = compute_embeddings_enabled(
-        cfg.embeddings.enabled,
-        cli.no_embeddings,
-        active_backend,
-    ) && std::env::var("ICM_NO_EMBEDDINGS").is_err();
+    let embeddings_enabled =
+        compute_embeddings_enabled(cfg.embeddings.enabled, cli.no_embeddings, active_backend)
+            && std::env::var("ICM_NO_EMBEDDINGS").is_err();
     #[allow(unused_variables)]
     let (embedder, cache_metrics): BuiltEmbedder = if embeddings_enabled {
         build_embedder(&cfg)

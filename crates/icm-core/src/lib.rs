@@ -9,14 +9,14 @@ pub mod facts;
 pub mod facts_store;
 #[cfg(feature = "embeddings")]
 pub mod fastembed_embedder;
-#[cfg(feature = "cloud-embeddings")]
-pub mod openai_embedder;
 pub mod feedback;
 pub mod feedback_store;
 pub mod learn;
 pub mod memoir;
 pub mod memoir_store;
 pub mod memory;
+#[cfg(feature = "cloud-embeddings")]
+pub mod openai_embedder;
 pub mod remote_protocol;
 pub mod store;
 pub mod transcript;
@@ -27,6 +27,9 @@ pub mod wake_up;
 pub const DEFAULT_EMBEDDING_DIMS: usize = 384;
 
 pub use auto_link::{add_backrefs, auto_link_memory, AutoLinkOptions};
+pub use cache::CacheMetrics;
+#[cfg(feature = "cloud-embeddings")]
+pub use caching_embedder::CachingEmbedder;
 pub use context_snapshot::{
     build_context_snapshot, build_context_snapshot_from_memories, ContextSnapshot,
     ContextSnapshotOptions, SnapshotFormat, SnapshotSection, SNAPSHOT_HEADER,
@@ -37,11 +40,6 @@ pub use facts::{Fact, FactsStats};
 pub use facts_store::FactsStore;
 #[cfg(feature = "embeddings")]
 pub use fastembed_embedder::FastEmbedder;
-pub use cache::CacheMetrics;
-#[cfg(feature = "cloud-embeddings")]
-pub use caching_embedder::CachingEmbedder;
-#[cfg(feature = "cloud-embeddings")]
-pub use openai_embedder::OpenAiEmbedder;
 pub use feedback::{Feedback, FeedbackStats};
 pub use feedback_store::FeedbackStore;
 pub use memoir::{Concept, ConceptLink, Label, Memoir, MemoirStats, Relation};
@@ -49,6 +47,8 @@ pub use memoir_store::MemoirStore;
 pub use memory::{
     Importance, Memory, MemorySource, PatternCluster, Scope, StoreStats, TopicHealth,
 };
+#[cfg(feature = "cloud-embeddings")]
+pub use openai_embedder::OpenAiEmbedder;
 pub use remote_protocol::{is_known_method, RpcRequest, RpcResponse, ALL_METHODS};
 pub use store::{find_similar_memory, MemoryStore, DEDUP_SIMILARITY_THRESHOLD};
 pub use transcript::{Message, Role, Session, TranscriptHit, TranscriptStats};

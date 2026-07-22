@@ -29,7 +29,9 @@ use crate::common::{CodeArea, HookEvent, HookEventInsert, HookStatsRow, PendingR
 /// Build the standard "not available in remote mode" error for the
 /// node-local operational surface (F-001, authorized simplification).
 fn remote_unsupported(op: &str) -> IcmError {
-    IcmError::Unsupported(format!("{op} is a node-local operation, unavailable in remote mode"))
+    IcmError::Unsupported(format!(
+        "{op} is a node-local operation, unavailable in remote mode"
+    ))
 }
 
 /// A store backed by a remote `icm serve --http` node.
@@ -108,7 +110,10 @@ impl MemoryStore for RemoteHttpStore {
     }
 
     fn search_fts(&self, query: &str, limit: usize) -> IcmResult<Vec<Memory>> {
-        self.call_de("memory.search_fts", json!({ "query": query, "limit": limit }))
+        self.call_de(
+            "memory.search_fts",
+            json!({ "query": query, "limit": limit }),
+        )
     }
 
     fn search_by_embedding(
@@ -131,7 +136,10 @@ impl MemoryStore for RemoteHttpStore {
         // Remote mode: the server embeds the query text. The caller's
         // `embedding` argument is intentionally ignored — a thin client
         // has no model (the "zero local resources" invariant).
-        self.call_de("memory.search_hybrid", json!({ "query": query, "limit": limit }))
+        self.call_de(
+            "memory.search_hybrid",
+            json!({ "query": query, "limit": limit }),
+        )
     }
 
     fn update_access(&self, id: &str) -> IcmResult<()> {
@@ -144,11 +152,17 @@ impl MemoryStore for RemoteHttpStore {
     }
 
     fn apply_decay(&self, decay_factor: f32) -> IcmResult<usize> {
-        self.call_de("memory.apply_decay", json!({ "decay_factor": decay_factor }))
+        self.call_de(
+            "memory.apply_decay",
+            json!({ "decay_factor": decay_factor }),
+        )
     }
 
     fn prune(&self, weight_threshold: f32) -> IcmResult<usize> {
-        self.call_de("memory.prune", json!({ "weight_threshold": weight_threshold }))
+        self.call_de(
+            "memory.prune",
+            json!({ "weight_threshold": weight_threshold }),
+        )
     }
 
     fn list_all(&self) -> IcmResult<Vec<Memory>> {
@@ -238,7 +252,10 @@ impl FeedbackStore for RemoteHttpStore {
     }
 
     fn list_feedback(&self, topic: Option<&str>, limit: usize) -> IcmResult<Vec<Feedback>> {
-        self.call_de("feedback.list_feedback", json!({ "topic": topic, "limit": limit }))
+        self.call_de(
+            "feedback.list_feedback",
+            json!({ "topic": topic, "limit": limit }),
+        )
     }
 
     fn increment_applied(&self, id: &str) -> IcmResult<()> {
@@ -645,10 +662,7 @@ impl RemoteHttpStore {
     }
 
     /// Composed client-side from `memory.list_topics` + prefix filter.
-    pub fn list_topics_with_prefix(
-        &self,
-        prefix: Option<&str>,
-    ) -> IcmResult<Vec<(String, usize)>> {
+    pub fn list_topics_with_prefix(&self, prefix: Option<&str>) -> IcmResult<Vec<(String, usize)>> {
         let topics = self.list_topics()?;
         Ok(match prefix {
             Some(p) => topics
@@ -724,8 +738,7 @@ mod tests {
                     .position(|w| w == b"\r\n\r\n")
                     .map(|p| p + 4)
                     .unwrap_or(acc.len());
-                let body: Value =
-                    serde_json::from_slice(&acc[body_start..]).unwrap_or(Value::Null);
+                let body: Value = serde_json::from_slice(&acc[body_start..]).unwrap_or(Value::Null);
                 let method = body.get("method").and_then(Value::as_str).unwrap_or("");
                 let result = match method {
                     "memory.store" => {

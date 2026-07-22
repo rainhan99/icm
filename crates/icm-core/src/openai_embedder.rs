@@ -138,10 +138,7 @@ mod tests {
                 let mut acc: Vec<u8> = Vec::new();
                 let mut tmp = [0u8; 1024];
                 loop {
-                    let header_end = acc
-                        .windows(4)
-                        .position(|w| w == b"\r\n\r\n")
-                        .map(|p| p + 4);
+                    let header_end = acc.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4);
                     if let Some(hend) = header_end {
                         let headers = String::from_utf8_lossy(&acc[..hend]).to_lowercase();
                         let want = headers
