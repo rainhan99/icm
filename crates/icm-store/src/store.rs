@@ -234,6 +234,8 @@ impl SqliteStore {
         )
         .map_err(db_err)?;
         init_db_with_dims(&conn, embedding_dims)?;
+        #[cfg(feature = "code-graph")]
+        crate::code_graph_schema::init_code_graph(&conn)?;
         Ok(Self {
             conn,
             cache: Mutex::new(new_cache()),
@@ -690,6 +692,8 @@ impl SqliteStore {
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=30000;")
             .map_err(db_err)?;
         init_db_with_dims(&conn, embedding_dims)?;
+        #[cfg(feature = "code-graph")]
+        crate::code_graph_schema::init_code_graph(&conn)?;
         Ok(Self {
             conn,
             cache: Mutex::new(new_cache()),
