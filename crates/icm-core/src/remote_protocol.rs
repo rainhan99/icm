@@ -162,6 +162,7 @@ pub const ALL_METHODS: &[&str] = &[
     "code.callees",
     "code.explore",
     "code.list_stale",
+    "code.mark_stale",
     "code.code_stats",
 ];
 

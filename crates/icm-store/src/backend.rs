@@ -811,6 +811,9 @@ impl CodeGraphStore for Store {
     fn list_stale(&self) -> IcmResult<Vec<String>> {
         cg_forward!(self, list_stale())
     }
+    fn mark_stale(&self, paths: &[String]) -> IcmResult<()> {
+        cg_forward!(self, mark_stale(paths))
+    }
     fn code_stats(&self) -> IcmResult<CodeStats> {
         cg_forward!(self, code_stats())
     }

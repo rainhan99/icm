@@ -51,6 +51,9 @@ struct Parsed {
     file: CodeFile,
     symbols: Vec<Symbol>,
     refs: Vec<Ref>,
+    /// Whether this file's content changed vs the stored hash (always
+    /// true for a full index).
+    changed: bool,
 }
 
 /// Index all supported files under `root` into `store`. When
@@ -92,14 +95,14 @@ pub fn index_path(store: &Store, root: &Path, incremental: bool) -> Result<Index
             continue;
         };
         let hash = content_hash(&source);
-        if incremental {
-            if let Ok(Some(existing)) = store.file_hash(&rel) {
-                if existing == hash {
-                    skipped += 1;
-                    continue;
-                }
-            }
-        }
+        // Parse every file (so cross-file resolution stays correct), but
+        // remember which ones actually changed so incremental runs only
+        // WRITE the changed files.
+        let changed = if incremental {
+            store.file_hash(&rel).ok().flatten().as_deref() != Some(hash.as_str())
+        } else {
+            true
+        };
         let pf = match code_parse::parse_file(language, &rel, &source) {
             Ok(p) => p,
             Err(_) => {
@@ -117,19 +120,27 @@ pub fn index_path(store: &Store, root: &Path, incremental: bool) -> Result<Index
             },
             symbols: pf.symbols,
             refs: pf.refs,
+            changed,
         });
     }
 
-    // Pass 2 — resolve references against the full symbol set, then store.
+    // Pass 2 — resolve references against the full symbol set, then store
+    // only the changed files (index_file also clears their stale flag).
     let mut symbols = 0usize;
+    let mut indexed = 0usize;
     for p in &mut parsed {
+        if !p.changed {
+            skipped += 1;
+            continue;
+        }
         code_resolve::resolve_refs(&all_symbols, &mut p.refs);
         store.index_file(&p.file, &p.symbols, &p.refs)?;
         symbols += p.symbols.len();
+        indexed += 1;
     }
 
     Ok(IndexReport {
-        files_indexed: parsed.len(),
+        files_indexed: indexed,
         files_skipped: skipped,
         symbols,
     })
@@ -164,5 +175,30 @@ mod tests {
         // The call foo -> bar resolved to a real edge.
         let bar = store.find_symbols("bar", 5).unwrap().into_iter().next().unwrap();
         assert_eq!(store.callers(&bar.id).unwrap().len(), 1, "foo calls bar");
+    }
+
+    #[test]
+    fn incremental_reindexes_changed_only_and_clears_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.rs"), "fn foo(){}").unwrap();
+        fs::write(root.join("b.rs"), "fn keep(){}").unwrap();
+        let store = Store::in_memory().unwrap();
+        index_path(&store, root, false).unwrap();
+
+        // Edit only a.rs; mark it stale (simulating the hook).
+        fs::write(root.join("a.rs"), "fn qux(){}").unwrap();
+        store.mark_stale(&["a.rs".to_string()]).unwrap();
+        assert_eq!(store.list_stale().unwrap(), vec!["a.rs".to_string()]);
+
+        let report = index_path(&store, root, true).unwrap();
+        assert_eq!(report.files_indexed, 1, "only a.rs re-stored");
+        assert_eq!(report.files_skipped, 1, "b.rs unchanged, skipped");
+        // a.rs symbols updated; b.rs untouched.
+        assert!(store.find_symbols("foo", 5).unwrap().is_empty(), "old foo gone");
+        assert_eq!(store.find_symbols("qux", 5).unwrap().len(), 1);
+        assert_eq!(store.find_symbols("keep", 5).unwrap().len(), 1);
+        // Re-index cleared a.rs's stale flag.
+        assert!(store.list_stale().unwrap().is_empty(), "stale cleared after reindex");
     }
 }

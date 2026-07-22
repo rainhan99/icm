@@ -236,6 +236,15 @@ impl CodeGraphStore for SqliteStore {
         Ok(rows)
     }
 
+    fn mark_stale(&self, paths: &[String]) -> IcmResult<()> {
+        let conn = self.cg_conn();
+        for p in paths {
+            conn.execute("UPDATE cg_files SET stale = 1 WHERE path = ?1", params![p])
+                .map_err(db_err)?;
+        }
+        Ok(())
+    }
+
     fn code_stats(&self) -> IcmResult<CodeStats> {
         let conn = self.cg_conn();
         let count = |sql: &str| -> IcmResult<usize> {

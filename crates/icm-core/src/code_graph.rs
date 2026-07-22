@@ -212,6 +212,12 @@ pub trait CodeGraphStore {
     /// Paths currently flagged stale (edited but not re-indexed).
     fn list_stale(&self) -> IcmResult<Vec<String>>;
 
+    /// Flag the given (repo-relative) paths as stale — edited but not yet
+    /// re-indexed. No-op for paths not in the graph. Cleared by
+    /// `index_file`. Used by the PostToolUse hook (cheap; the actual
+    /// re-parse happens on the next `icm code index --incremental`).
+    fn mark_stale(&self, paths: &[String]) -> IcmResult<()>;
+
     fn code_stats(&self) -> IcmResult<CodeStats>;
 }
 

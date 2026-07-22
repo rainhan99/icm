@@ -3322,6 +3322,24 @@ fn cmd_hook_post(
                 session_id,
                 Some(tool_name),
             );
+
+            // F-002: flag the edited file stale in the code graph so the
+            // next `icm code index --incremental` re-parses it. Cheap
+            // (one UPDATE), best-effort, repo-relative key, no-op if the
+            // file isn't indexed. Never blocks the hook.
+            #[cfg(feature = "code-graph")]
+            {
+                let rel = std::env::current_dir()
+                    .ok()
+                    .and_then(|cwd| {
+                        std::path::Path::new(&file_path)
+                            .strip_prefix(&cwd)
+                            .ok()
+                            .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    })
+                    .unwrap_or_else(|| file_path.clone());
+                let _ = icm_core::CodeGraphStore::mark_stale(store, &[rel]);
+            }
         }
     }
 
