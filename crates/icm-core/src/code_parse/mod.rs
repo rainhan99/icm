@@ -16,6 +16,7 @@ use crate::code_graph::{CodeLanguage, Ref, Symbol};
 use crate::error::{IcmError, IcmResult};
 
 mod rust;
+mod typescript;
 
 /// Result of parsing one file: definitions + (unresolved) reference edges.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -49,7 +50,10 @@ pub fn parse_file(language: CodeLanguage, rel_path: &str, source: &str) -> IcmRe
 
     let (symbols, refs) = match language {
         CodeLanguage::Rust => rust::extract(root, source, rel_path),
-        // Other languages land in later tasks; empty until then.
+        CodeLanguage::TypeScript | CodeLanguage::JavaScript => {
+            typescript::extract(root, source, rel_path, language)
+        }
+        // Remaining languages land in later tasks; empty until then.
         _ => (Vec::new(), Vec::new()),
     };
     Ok(ParsedFile { symbols, refs })
@@ -94,5 +98,29 @@ mod tests {
         assert_eq!(foo.kind, SymbolKind::Function);
         let bar = parsed.symbols.iter().find(|s| s.name == "Bar").unwrap();
         assert_eq!(bar.kind, SymbolKind::Struct);
+    }
+
+    #[test]
+    fn typescript_extracts_function_and_class() {
+        let parsed = parse_file(
+            CodeLanguage::TypeScript,
+            "src/a.ts",
+            "export function foo(){} class Bar{ m(){} }",
+        )
+        .expect("parse");
+        let get = |n: &str| parsed.symbols.iter().find(|s| s.name == n).cloned();
+        assert_eq!(get("foo").map(|s| s.kind), Some(SymbolKind::Function));
+        assert_eq!(get("Bar").map(|s| s.kind), Some(SymbolKind::Class));
+        assert_eq!(get("m").map(|s| s.kind), Some(SymbolKind::Method));
+    }
+
+    #[test]
+    fn javascript_arrow_const_is_function() {
+        let parsed = parse_file(CodeLanguage::JavaScript, "src/a.js", "const foo = () => {};")
+            .expect("parse");
+        assert_eq!(
+            parsed.symbols.iter().find(|s| s.name == "foo").map(|s| s.kind),
+            Some(SymbolKind::Function)
+        );
     }
 }
