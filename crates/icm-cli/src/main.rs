@@ -2121,7 +2121,21 @@ fn main() -> Result<()> {
                 // `embedder` is already a boxed trait object (F-001); the
                 // HTTP server takes ownership of the warm embedder and the
                 // cache metrics handle (for /cache).
-                return http_api::run_http_server(store, embedder, cache_metrics, addr, token);
+                // F-003: an empty [remote] tokens map means single-token
+                // (F-001) mode; a populated one enables token→tenant auth.
+                let tokens = if cfg.remote.tokens.is_empty() {
+                    None
+                } else {
+                    Some(cfg.remote.tokens.clone())
+                };
+                return http_api::run_http_server(
+                    store,
+                    embedder,
+                    cache_metrics,
+                    addr,
+                    token,
+                    tokens,
+                );
             }
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_deref().map(|e| e as &dyn icm_core::Embedder);
