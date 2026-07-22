@@ -2,6 +2,8 @@ pub mod auto_link;
 pub mod cache;
 #[cfg(feature = "code-graph")]
 pub mod code_graph;
+#[cfg(feature = "code-graph")]
+pub mod code_parse;
 #[cfg(feature = "cloud-embeddings")]
 pub mod caching_embedder;
 pub mod context_snapshot;
