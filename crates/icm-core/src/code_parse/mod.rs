@@ -17,6 +17,7 @@ use crate::error::{IcmError, IcmResult};
 
 mod go;
 mod python;
+mod refs;
 mod rust;
 mod typescript;
 
@@ -50,7 +51,7 @@ pub fn parse_file(language: CodeLanguage, rel_path: &str, source: &str) -> IcmRe
         .ok_or_else(|| IcmError::CodeGraph(format!("parse failed for {rel_path}")))?;
     let root = tree.root_node();
 
-    let (symbols, refs) = match language {
+    let (symbols, _) = match language {
         CodeLanguage::Rust => rust::extract(root, source, rel_path),
         CodeLanguage::TypeScript | CodeLanguage::JavaScript => {
             typescript::extract(root, source, rel_path, language)
@@ -58,6 +59,7 @@ pub fn parse_file(language: CodeLanguage, rel_path: &str, source: &str) -> IcmRe
         CodeLanguage::Python => python::extract(root, source, rel_path),
         CodeLanguage::Go => go::extract(root, source, rel_path),
     };
+    let refs = refs::extract_refs(root, source, language, &symbols);
     Ok(ParsedFile { symbols, refs })
 }
 
@@ -87,7 +89,7 @@ pub(crate) fn field_text(node: &Node, field: &str, source: &str) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::code_graph::SymbolKind;
+    use crate::code_graph::{RefKind, SymbolKind};
 
     #[test]
     fn rust_extracts_function_and_struct() {
@@ -114,6 +116,20 @@ mod tests {
         assert_eq!(get("foo").map(|s| s.kind), Some(SymbolKind::Function));
         assert_eq!(get("Bar").map(|s| s.kind), Some(SymbolKind::Class));
         assert_eq!(get("m").map(|s| s.kind), Some(SymbolKind::Method));
+    }
+
+    #[test]
+    fn rust_extracts_call_edge() {
+        let parsed = parse_file(CodeLanguage::Rust, "a.rs", "fn a(){ b(); }\nfn b(){}").expect("parse");
+        let a = parsed.symbols.iter().find(|s| s.name == "a").unwrap();
+        let call = parsed
+            .refs
+            .iter()
+            .find(|r| r.target_name == "b")
+            .expect("call edge to b");
+        assert_eq!(call.kind, RefKind::Call);
+        assert_eq!(call.from_symbol, a.id, "call attributed to enclosing fn a");
+        assert!(call.target_symbol.is_none(), "unresolved at this stage");
     }
 
     #[test]
