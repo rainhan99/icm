@@ -72,6 +72,36 @@ Code-graph indexing of ICM itself: 87 files, 2619 symbols, 21386 refs;
 `icm code explore` answers structural queries in one call (see
 `docs/code-graph.md`).
 
+## F-003 (remote hardening: supersession + auth scaffold) — zero regression
+
+F-003 phase-1 is additive and the default hot path is unchanged:
+
+- **Supersession** is wired into the CLI `cmd_store` and MCP `tool_store`
+  wrappers, **not** the `MemoryStore::store` trait method the bench times —
+  so the benched store path does not invoke it. When enabled (default 0.90)
+  it adds one KNN lookup per *interactive* store; when disabled (`>= 1.0`)
+  the path is byte-identical to today.
+- **Read-path change:** every recall/list/count query gained an
+  `AND superseded_at IS NULL` predicate (T3). The bench measures its cost
+  directly (FTS/vector/hybrid search).
+- **Auth scaffold** lives entirely in the `http-api` server path — not the
+  local store — so it cannot affect these figures.
+
+Bench after F-003 (`--release`, `--count 5000`, median of 3 runs), vs the
+F-002 archive above:
+
+| Operation | F-002 | F-003 | Δ |
+|---|---|---|---|
+| Store (no embeddings) | 23.3 µs/op | 19.5 µs/op | within noise (faster) |
+| Store (with embeddings) | 33.7 µs/op | 34.3 µs/op | +1.8% (noise) |
+| FTS5 search | 28.3 µs/op | 30.0 µs/op | +6% (noise; 100-op timer) |
+| Vector search (KNN) | 1.1 ms/op | 1.1 ms/op | = |
+| Hybrid search | 1.2 ms/op | 1.2 ms/op | = |
+
+No regression — every metric within the ≤ 8% gate. The `superseded_at IS
+NULL` predicate is not measurable above run-to-run noise (the FTS timer runs
+only 100 ops over ~3 ms, so a fraction of a ms reads as several percent).
+
 ## How to re-run
 
 ```bash
