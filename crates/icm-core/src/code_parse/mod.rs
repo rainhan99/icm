@@ -15,6 +15,7 @@ use tree_sitter::{Node, Parser};
 use crate::code_graph::{CodeLanguage, Ref, Symbol};
 use crate::error::{IcmError, IcmResult};
 
+mod python;
 mod rust;
 mod typescript;
 
@@ -53,7 +54,9 @@ pub fn parse_file(language: CodeLanguage, rel_path: &str, source: &str) -> IcmRe
         CodeLanguage::TypeScript | CodeLanguage::JavaScript => {
             typescript::extract(root, source, rel_path, language)
         }
+        CodeLanguage::Python => python::extract(root, source, rel_path),
         // Remaining languages land in later tasks; empty until then.
+        #[allow(unreachable_patterns)]
         _ => (Vec::new(), Vec::new()),
     };
     Ok(ParsedFile { symbols, refs })
@@ -112,6 +115,16 @@ mod tests {
         assert_eq!(get("foo").map(|s| s.kind), Some(SymbolKind::Function));
         assert_eq!(get("Bar").map(|s| s.kind), Some(SymbolKind::Class));
         assert_eq!(get("m").map(|s| s.kind), Some(SymbolKind::Method));
+    }
+
+    #[test]
+    fn python_extracts_function_class_method() {
+        let src = "def foo():\n    pass\n\nclass Bar:\n    def m(self):\n        pass\n";
+        let parsed = parse_file(CodeLanguage::Python, "a.py", src).expect("parse");
+        let get = |n: &str| parsed.symbols.iter().find(|s| s.name == n).map(|s| s.kind);
+        assert_eq!(get("foo"), Some(SymbolKind::Function));
+        assert_eq!(get("Bar"), Some(SymbolKind::Class));
+        assert_eq!(get("m"), Some(SymbolKind::Method));
     }
 
     #[test]
