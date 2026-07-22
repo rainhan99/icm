@@ -4,6 +4,8 @@ pub mod cache;
 pub mod code_graph;
 #[cfg(feature = "code-graph")]
 pub mod code_parse;
+#[cfg(feature = "code-graph")]
+pub mod code_resolve;
 #[cfg(feature = "cloud-embeddings")]
 pub mod caching_embedder;
 pub mod context_snapshot;
