@@ -39,6 +39,11 @@ opensearch = ["dep:ureq", "dep:base64"]
 # local backend so one binary can be client or server.
 remote-store = ["dep:ureq"]
 
+# Code-graph storage (F-002): the cg_* tables + CodeGraphStore impl.
+# Stores symbols/refs (data only) — parsing lives in icm-core, so this
+# pulls no tree-sitter deps directly.
+code-graph = ["icm-core/code-graph"]
+
 [dependencies]
 icm-core = { path = "../icm-core" }
 serde = { workspace = true }

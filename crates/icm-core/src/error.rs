@@ -46,6 +46,13 @@ pub enum IcmError {
     /// fault apart from a backend-local storage fault.
     #[error("remote store error: {0}")]
     Remote(String),
+
+    /// A code-graph operation failed (F-002): tree-sitter parse error,
+    /// unsupported language, or a code-graph store fault. Distinct from
+    /// [`IcmError::Database`] so callers can tell a parsing/indexing fault
+    /// apart from a generic storage fault.
+    #[error("code graph error: {0}")]
+    CodeGraph(String),
 }
 
 pub type IcmResult<T> = Result<T, IcmError>;
@@ -56,5 +63,11 @@ mod tests {
     fn remote_error_displays() {
         let e = super::IcmError::Remote("connection refused".into());
         assert_eq!(e.to_string(), "remote store error: connection refused");
+    }
+
+    #[test]
+    fn code_graph_error_displays() {
+        let e = super::IcmError::CodeGraph("parse failed".into());
+        assert_eq!(e.to_string(), "code graph error: parse failed");
     }
 }

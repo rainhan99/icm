@@ -17,7 +17,7 @@ path = "src/main.rs"
 # `ICM_DB_BACKEND` (issue #301). Backends are additive; for a lean build
 # (e.g. SQLite-only) use `--no-default-features --features
 # "embeddings,tui,http-api,backend-sqlite"`.
-default = ["embeddings", "tui", "http-api", "backend-sqlite", "postgres", "opensearch"]
+default = ["embeddings", "tui", "http-api", "backend-sqlite", "postgres", "opensearch", "code-graph"]
 embeddings = ["icm-core/embeddings", "icm-mcp/embeddings"]
 # OpenAI-compatible cloud embedder + embedding cache (F-001). Additive,
 # default-OFF per the "single binary, zero deps" promise: the runtime
@@ -33,6 +33,9 @@ opensearch = ["icm-store/opensearch", "icm-mcp/opensearch"]
 # Remote store client (F-001), default-OFF. `ICM_DB_BACKEND=remote` makes
 # this icm a thin client of a central `icm serve --http` node.
 remote-store = ["icm-store/remote-store", "icm-mcp/remote-store"]
+# Code-graph subsystem (F-002), default-ON (in `default` above); strip via
+# --no-default-features to drop tree-sitter entirely.
+code-graph = ["icm-core/code-graph", "icm-store/code-graph", "icm-mcp/code-graph"]
 # Persistent local HTTP server (`icm serve --http`) reusing the warm
 # store + embedder. Lightweight: just axum + tokio. Issue #290.
 http-api = ["dep:axum", "dep:tokio"]

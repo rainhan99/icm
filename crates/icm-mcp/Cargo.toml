@@ -15,6 +15,8 @@ opensearch = ["icm-store/opensearch"]
 # icm-mcp --features remote-store` can exercise the MCP server against a
 # remote backend.
 remote-store = ["icm-store/remote-store"]
+# Code-graph MCP tool (F-002): icm_code_explore.
+code-graph = ["icm-core/code-graph", "icm-store/code-graph"]
 
 [dependencies]
 icm-core = { path = "../icm-core" }

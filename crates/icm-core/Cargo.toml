@@ -12,6 +12,18 @@ embeddings = ["dep:fastembed", "dep:directories", "dep:cachedir"]
 # surface, no async runtime); `sha2` = cache key hashing; `lru` =
 # in-memory hot layer; `directories` = default cache dir resolution.
 cloud-embeddings = ["dep:ureq", "dep:sha2", "dep:lru", "dep:directories"]
+# Code-graph subsystem (F-002): tree-sitter parsing kernel for Rust,
+# TS/JS, Python, Go. Additive; grammars are C and only compiled when this
+# feature is on. Runtime + grammar crates are ABI-decoupled via
+# `tree-sitter-language`, so the exact versions below are locked to a set
+# that compiles together (verified by `cargo build --features code-graph`).
+code-graph = [
+    "dep:tree-sitter",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-typescript",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-go",
+]
 
 [dependencies]
 chrono = { workspace = true }
@@ -27,6 +39,12 @@ tracing = { workspace = true }
 ureq = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 lru = { workspace = true, optional = true }
+# Code-graph parsing kernel (F-002, feature `code-graph`). ABI-coherent set.
+tree-sitter = { version = "0.25", optional = true }
+tree-sitter-rust = { version = "0.24", optional = true }
+tree-sitter-typescript = { version = "0.23", optional = true }
+tree-sitter-python = { version = "0.23", optional = true }
+tree-sitter-go = { version = "0.23", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
