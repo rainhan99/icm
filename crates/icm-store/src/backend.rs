@@ -772,8 +772,8 @@ macro_rules! cg_forward {
         match $self {
             #[cfg(feature = "backend-sqlite")]
             Store::Sqlite(s) => s.$m($($a),*),
-            // Remote arm is added in T19 once RemoteHttpStore implements
-            // CodeGraphStore; until then remote falls through to Unsupported.
+            #[cfg(feature = "remote-store")]
+            Store::Remote(s) => s.$m($($a),*),
             #[allow(unreachable_patterns)]
             _ => Err(IcmError::Unsupported(
                 concat!("code_graph.", stringify!($m)).to_string(),

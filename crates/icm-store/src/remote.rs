@@ -26,6 +26,9 @@ use icm_core::{
 
 use crate::common::{CodeArea, HookEvent, HookEventInsert, HookStatsRow, PendingRow};
 
+#[cfg(feature = "code-graph")]
+use icm_core::{CodeFile, CodeGraphStore, CodeStats, ExploreResult, Ref, Symbol};
+
 /// Build the standard "not available in remote mode" error for the
 /// node-local operational surface (F-001, authorized simplification).
 fn remote_unsupported(op: &str) -> IcmError {
@@ -689,6 +692,52 @@ impl RemoteHttpStore {
     }
 }
 
+// CodeGraphStore over JSON-RPC (F-002). `explore` OVERRIDES the trait
+// default so the client makes a single `code.explore` call and the server
+// computes the blast radius — no cross-network BFS.
+#[cfg(feature = "code-graph")]
+impl CodeGraphStore for RemoteHttpStore {
+    fn index_file(&self, file: &CodeFile, symbols: &[Symbol], refs: &[Ref]) -> IcmResult<()> {
+        self.call(
+            "code.index_file",
+            json!({ "file": file, "symbols": symbols, "refs": refs }),
+        )?;
+        Ok(())
+    }
+    fn delete_file(&self, path: &str) -> IcmResult<()> {
+        self.call("code.delete_file", json!({ "path": path }))?;
+        Ok(())
+    }
+    fn file_hash(&self, path: &str) -> IcmResult<Option<String>> {
+        self.call_de("code.file_hash", json!({ "path": path }))
+    }
+    fn get_symbol(&self, id: &str) -> IcmResult<Option<Symbol>> {
+        self.call_de("code.get_symbol", json!({ "id": id }))
+    }
+    fn find_symbols(&self, name: &str, limit: usize) -> IcmResult<Vec<Symbol>> {
+        self.call_de("code.find_symbols", json!({ "name": name, "limit": limit }))
+    }
+    fn callers(&self, symbol_id: &str) -> IcmResult<Vec<Symbol>> {
+        self.call_de("code.callers", json!({ "symbol_id": symbol_id }))
+    }
+    fn callees(&self, symbol_id: &str) -> IcmResult<Vec<Symbol>> {
+        self.call_de("code.callees", json!({ "symbol_id": symbol_id }))
+    }
+    fn explore(&self, name: &str, max_depth: usize) -> IcmResult<Option<ExploreResult>> {
+        self.call_de("code.explore", json!({ "name": name, "max_depth": max_depth }))
+    }
+    fn list_stale(&self) -> IcmResult<Vec<String>> {
+        self.call_de("code.list_stale", json!({}))
+    }
+    fn mark_stale(&self, paths: &[String]) -> IcmResult<()> {
+        self.call("code.mark_stale", json!({ "paths": paths }))?;
+        Ok(())
+    }
+    fn code_stats(&self) -> IcmResult<CodeStats> {
+        self.call_de("code.code_stats", json!({}))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,6 +804,12 @@ mod tests {
                     "feedback.list_feedback" => json!({ "result": [] }),
                     "memoir.list_memoirs" => json!({ "result": [] }),
                     "transcript.list_sessions" => json!({ "result": [] }),
+                    // Code-graph canned responses (T19).
+                    "code.code_stats" => json!({ "result": {
+                        "files": 1, "symbols": 2, "refs": 1, "stale_files": 0,
+                        "by_language": [["rust", 2]]
+                    }}),
+                    "code.find_symbols" => json!({ "result": [] }),
                     _ => json!({ "result": null }),
                 };
                 let payload = result.to_string();
@@ -802,6 +857,29 @@ mod tests {
         assert!(r.list_feedback(None, 10).unwrap().is_empty());
         assert!(r.list_memoirs().unwrap().is_empty());
         assert!(r.list_sessions(None, 10).unwrap().is_empty());
+    }
+
+    #[cfg(feature = "code-graph")]
+    #[test]
+    fn remote_code_graph_forwards() {
+        use icm_core::{CodeFile, CodeGraphStore, CodeLanguage};
+        let url = spawn_mock_server();
+        let r = RemoteHttpStore::new(&url, None);
+        // code_stats parses a CodeStats from the server.
+        let stats = r.code_stats().unwrap();
+        assert_eq!(stats.symbols, 2);
+        assert_eq!(stats.files, 1);
+        // find_symbols parses an (empty) Vec.
+        assert!(r.find_symbols("x", 5).unwrap().is_empty());
+        // index_file / mark_stale return Ok on a null result.
+        let file = CodeFile {
+            path: "f.rs".into(),
+            language: CodeLanguage::Rust,
+            content_hash: "h".into(),
+            stale: false,
+        };
+        assert!(r.index_file(&file, &[], &[]).is_ok());
+        assert!(r.mark_stale(&["f.rs".to_string()]).is_ok());
     }
 
     #[test]
