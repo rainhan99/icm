@@ -839,12 +839,16 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         related_ids,
         embedding,
         scope: icm_core::Scope::User, // default for existing local memories
+        superseded_at: row
+            .get::<_, Option<String>>(15)?
+            .map(|s| parse_dt(&s)),
     })
 }
 
 const SELECT_COLS: &str = "id, created_at, updated_at, last_accessed, access_count, weight, \
                            topic, summary, raw_excerpt, keywords, \
-                           importance, source_type, source_data, related_ids, embedding";
+                           importance, source_type, source_data, related_ids, embedding, \
+                           superseded_at";
 
 /// Sanitize a query string for FTS5 MATCH.
 ///
@@ -1034,8 +1038,9 @@ impl SqliteStore {
             .execute(
                 "INSERT OR IGNORE INTO memories (id, created_at, updated_at, last_accessed, access_count, weight,
                  topic, summary, raw_excerpt, keywords,
-                 importance, source_type, source_data, related_ids, embedding, summary_hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                 importance, source_type, source_data, related_ids, embedding, summary_hash,
+                 superseded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
                     memory.id,
                     memory.created_at.to_rfc3339(),
@@ -1053,6 +1058,7 @@ impl SqliteStore {
                     related_json,
                     emb_blob,
                     hash,
+                    memory.superseded_at.map(|d| d.to_rfc3339()),
                 ],
             )
             .map_err(db_err)?;
@@ -1218,7 +1224,7 @@ impl MemoryStore for SqliteStore {
                  updated_at = ?2, last_accessed = ?3, access_count = ?4, weight = ?5,
                  topic = ?6, summary = ?7, raw_excerpt = ?8, keywords = ?9,
                  importance = ?10, source_type = ?11, source_data = ?12, related_ids = ?13,
-                 embedding = ?14, summary_hash = ?15
+                 embedding = ?14, summary_hash = ?15, superseded_at = ?16
                  WHERE id = ?1",
                 params![
                     memory.id,
@@ -1236,6 +1242,7 @@ impl MemoryStore for SqliteStore {
                     related_json,
                     emb_blob,
                     hash,
+                    memory.superseded_at.map(|d| d.to_rfc3339()),
                 ],
             )
             .map_err(db_err)?;
@@ -3972,6 +3979,23 @@ mod tests {
             IcmError::Database(_) | IcmError::ReadOnly(_) => {}
             other => panic!("expected Database or ReadOnly, got {other:?}"),
         }
+    }
+
+    // === Memory supersession (F-003) ===
+
+    #[test]
+    fn memory_superseded_persist() {
+        use icm_core::{Importance, Memory, MemoryStore};
+        let s = SqliteStore::in_memory_with_dims(384).unwrap();
+        let mut m = Memory::new("profile".to_string(), "user lives in NYC".to_string(), Importance::Medium);
+        let id = s.store(m.clone()).unwrap();
+        m.id = id.clone();
+        // Mark superseded via the existing update() path (no new trait method).
+        m.superseded_at = Some(chrono::Utc::now());
+        s.update(&m).unwrap();
+        let got = s.get(&id).unwrap().unwrap();
+        assert!(got.superseded_at.is_some(), "superseded_at persisted");
+        assert!(!got.is_active());
     }
 
     // === Embedding dimension guard (F-001) ===
