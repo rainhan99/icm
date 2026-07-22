@@ -22,6 +22,7 @@
 //! bind explicitly. An optional `--token` enables `Authorization:
 //! Bearer <token>` checking; absent token = open localhost API.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -32,7 +33,7 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -61,10 +62,23 @@ pub struct AppState {
     embedder: Option<Arc<dyn Embedder + Send + Sync>>,
     /// When set, every request must carry `Authorization: Bearer <token>`.
     token: Option<String>,
+    /// F-003 token → tenant map. When non-empty it takes precedence over
+    /// `token`: the middleware resolves the Bearer token to a tenant and
+    /// rejects unknown tokens with 401. `None`/empty → F-001 single-token.
+    ///
+    /// SCAFFOLD: resolves identity only; does NOT isolate tenant data.
+    tokens: Option<HashMap<String, String>>,
     /// Embedding-cache metrics for `/cache` (F-001). `None` when the
     /// active embedder has no cache (local provider / no embedder).
     cache_metrics: Option<Arc<icm_core::CacheMetrics>>,
 }
+
+/// Resolved tenant identity for a request, injected into request extensions
+/// by [`auth_middleware`] and read by handlers (e.g. `/whoami`). Carries the
+/// tenant name only — never the token. `"default"` in F-001 single-token
+/// mode (or when auth is disabled).
+#[derive(Clone, Debug)]
+struct Tenant(String);
 
 impl AppState {
     fn embedder_ref(&self) -> Option<&dyn Embedder> {
@@ -173,11 +187,13 @@ pub async fn run_http_server(
     cache_metrics: Option<Arc<icm_core::CacheMetrics>>,
     addr: SocketAddr,
     token: Option<String>,
+    tokens: Option<HashMap<String, String>>,
 ) -> Result<()> {
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
         embedder: embedder.map(Arc::from),
         token,
+        tokens,
         cache_metrics,
     };
 
@@ -205,6 +221,7 @@ fn build_router(state: AppState) -> Router {
         .route("/stats", get(handle_stats))
         .route("/topics", get(handle_topics))
         .route("/health", get(handle_health))
+        .route("/whoami", get(handle_whoami))
         .route("/cache/stats", get(handle_cache_stats))
         .route("/cache", get(handle_cache_page));
     // The full store-RPC surface (F-001) — only when the remote-store
@@ -251,29 +268,79 @@ async fn handle_rpc(
 async fn auth_middleware(
     State(state): State<AppState>,
     headers: HeaderMap,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: Next,
 ) -> Response {
     // Health is always reachable so an unauth'd liveness probe works.
     if request.uri().path() == "/health" {
         return next.run(request).await;
     }
-    let Some(expected) = state.token.as_deref() else {
-        return next.run(request).await;
-    };
+
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(str::trim);
-    match presented {
-        Some(tok) if tok == expected => next.run(request).await,
-        _ => (
-            StatusCode::UNAUTHORIZED,
-            "missing or invalid Bearer token\n",
-        )
-            .into_response(),
+
+    // F-003 multi-tenant resolution takes precedence when a non-empty
+    // tokens map is configured: resolve Bearer → tenant, unknown → 401.
+    if let Some(map) = state.tokens.as_ref().filter(|m| !m.is_empty()) {
+        match presented.and_then(|tok| map.get(tok)) {
+            Some(tenant) => {
+                // Observability: log the RESOLVED TENANT only — never the
+                // token (it is a secret; see RemoteConfig::tokens).
+                tracing::info!(tenant = %tenant, path = %request.uri().path(), "authenticated");
+                request.extensions_mut().insert(Tenant(tenant.clone()));
+                return next.run(request).await;
+            }
+            None => {
+                return unauthorized();
+            }
+        }
     }
+
+    // F-001 single-token fallback. `default` tenant so `/whoami` and
+    // downstream extractors always find a Tenant in extensions.
+    match state.token.as_deref() {
+        None => {
+            request
+                .extensions_mut()
+                .insert(Tenant("default".to_string()));
+            next.run(request).await
+        }
+        Some(expected) => match presented {
+            Some(tok) if tok == expected => {
+                request
+                    .extensions_mut()
+                    .insert(Tenant("default".to_string()));
+                next.run(request).await
+            }
+            _ => unauthorized(),
+        },
+    }
+}
+
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        "missing or invalid Bearer token\n",
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Handler: /whoami (F-003)
+// ---------------------------------------------------------------------------
+
+/// Echo the tenant resolved by [`auth_middleware`]. Returns
+/// `{"tenant": "<name>"}` — `"default"` in single-token mode. NEVER echoes
+/// the token. Sits behind the auth middleware, so an unknown token is
+/// already rejected with 401 before reaching here.
+async fn handle_whoami(tenant: Option<Extension<Tenant>>) -> Response {
+    let name = tenant
+        .map(|Extension(t)| t.0)
+        .unwrap_or_else(|| "default".to_string());
+    Json(json!({ "tenant": name })).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -791,6 +858,7 @@ mod rpc_tests {
             store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
             embedder: None,
             token: token.map(str::to_string),
+            tokens: None,
             cache_metrics: None,
         }
     }
@@ -954,6 +1022,46 @@ mod cache_tests {
     use axum::http::Request;
     use tower::ServiceExt; // for `oneshot`
 
+    fn test_state(token: Option<&str>) -> AppState {
+        AppState {
+            store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
+            embedder: None,
+            token: token.map(str::to_string),
+            tokens: None,
+            cache_metrics: None,
+        }
+    }
+
+    /// State with a token→tenant map (F-003 multi-tenant mode).
+    fn test_state_multi(pairs: &[(&str, &str)]) -> AppState {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(t, tn)| (t.to_string(), tn.to_string()))
+            .collect();
+        AppState {
+            store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
+            embedder: None,
+            token: None,
+            tokens: Some(map),
+            cache_metrics: None,
+        }
+    }
+
+    fn get_request(path: &str, token: Option<&str>) -> Request<Body> {
+        let mut b = Request::get(path);
+        if let Some(t) = token {
+            b = b.header("authorization", format!("Bearer {t}"));
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    async fn body_json(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
     #[tokio::test]
     async fn cache_stats_endpoint_reports_metrics() {
         let metrics = Arc::new(icm_core::CacheMetrics::default());
@@ -964,6 +1072,7 @@ mod cache_tests {
             store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
             embedder: None,
             token: None,
+            tokens: None,
             cache_metrics: Some(Arc::clone(&metrics)),
         };
         let resp = build_router(state)
@@ -989,6 +1098,7 @@ mod cache_tests {
             store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
             embedder: None,
             token: None,
+            tokens: None,
             cache_metrics: Some(metrics),
         };
         let resp = build_router(state)
@@ -1019,6 +1129,7 @@ mod cache_tests {
             store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
             embedder: None,
             token: None,
+            tokens: None,
             cache_metrics: None,
         };
         let resp = build_router(state)
@@ -1030,5 +1141,100 @@ mod cache_tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["enabled"], serde_json::json!(false));
+    }
+
+    // === F-003 token→tenant auth scaffold (T7/T8) ===
+
+    #[tokio::test]
+    async fn auth_token_to_tenant() {
+        let app = build_router(test_state_multi(&[
+            ("tokA", "tenantA"),
+            ("tokB", "tenantB"),
+        ]));
+
+        // Valid token → 200 and body echoes the RESOLVED TENANT.
+        let ok = app
+            .clone()
+            .oneshot(get_request("/whoami", Some("tokA")))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let v = body_json(ok).await;
+        assert_eq!(v["tenant"], serde_json::json!("tenantA"));
+
+        // A different valid token resolves to its own tenant.
+        let ok_b = app
+            .clone()
+            .oneshot(get_request("/whoami", Some("tokB")))
+            .await
+            .unwrap();
+        assert_eq!(
+            body_json(ok_b).await["tenant"],
+            serde_json::json!("tenantB")
+        );
+
+        // Unknown token → 401.
+        let bad = app
+            .clone()
+            .oneshot(get_request("/whoami", Some("nope")))
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+
+        // Missing token → 401.
+        let none = app
+            .clone()
+            .oneshot(get_request("/whoami", None))
+            .await
+            .unwrap();
+        assert_eq!(none.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_token_to_tenant_never_echoes_token() {
+        let app = build_router(test_state_multi(&[("s3cr3t-token", "tenantA")]));
+        let ok = app
+            .oneshot(get_request("/whoami", Some("s3cr3t-token")))
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(ok.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            !body.contains("s3cr3t-token"),
+            "response must never echo the token: {body}"
+        );
+        assert!(body.contains("tenantA"));
+    }
+
+    #[tokio::test]
+    async fn whoami_endpoint() {
+        // Single-token mode (F-001 fallback): tenant reported as "default".
+        let app = build_router(test_state(Some("secret")));
+
+        let ok = app
+            .clone()
+            .oneshot(get_request("/whoami", Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(body_json(ok).await["tenant"], serde_json::json!("default"));
+
+        // Wrong token → 401 (fallback still enforces the single token).
+        let bad = app
+            .oneshot(get_request("/whoami", Some("wrong")))
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn whoami_open_mode_defaults_tenant() {
+        // No token and no tokens-map (open localhost API): tenant "default".
+        let app = build_router(test_state(None));
+        let ok = app.oneshot(get_request("/whoami", None)).await.unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(body_json(ok).await["tenant"], serde_json::json!("default"));
     }
 }

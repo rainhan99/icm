@@ -1066,52 +1066,69 @@ fn tool_store(
         memory.embedding = Some(vec.clone());
     }
 
-    // Dedup check: if a very similar memory exists in the same topic, update it instead
-    if let Some(ref query_emb) = embed_vec {
-        if let Ok(Some((existing, score))) = find_similar_memory(
-            store,
-            &embed_text,
-            query_emb,
-            topic,
-            DEDUP_SIMILARITY_THRESHOLD,
-        ) {
-            let updated = Memory {
-                id: existing.id.clone(),
-                created_at: existing.created_at,
-                last_accessed: existing.last_accessed,
-                access_count: existing.access_count,
-                weight: 1.0,
-                topic: existing.topic.clone(),
-                summary: content.to_string(),
-                raw_excerpt: get_str(args, "raw_excerpt")
-                    .map(|r| r.into())
-                    .or_else(|| existing.raw_excerpt.clone()),
-                keywords: {
-                    let kw = parse_keywords(args);
-                    if kw.is_empty() {
-                        existing.keywords.clone()
-                    } else {
-                        kw
-                    }
-                },
-                embedding: Some(query_emb.clone()),
-                importance,
-                source: existing.source.clone(),
-                related_ids: existing.related_ids.clone(),
-                updated_at: Utc::now(),
-                scope: existing.scope,
-            };
-            if let Err(e) = store.update(&updated) {
-                return ToolResult::error(format!("failed to update: {e}"));
+    // F-003 supersession: a very-near-duplicate (>= 0.90, stricter than
+    // dedup) marks the older same-topic memory superseded and stores the
+    // NEW one (temporal history) instead of merging. The MCP path uses the
+    // default threshold (config-driven threshold lives on the CLI path).
+    const SUPERSEDE_THRESHOLD: f32 = 0.90;
+    let superseded_id = match embed_vec.as_ref() {
+        Some(query_emb) => {
+            icm_core::supersede_similar(store, topic, query_emb, SUPERSEDE_THRESHOLD)
+                .unwrap_or(None)
+        }
+        None => None,
+    };
+
+    // Dedup check: if a very similar memory exists in the same topic, update
+    // it instead. Skipped when supersession already replaced an older row.
+    if superseded_id.is_none() {
+        if let Some(ref query_emb) = embed_vec {
+            if let Ok(Some((existing, score))) = find_similar_memory(
+                store,
+                &embed_text,
+                query_emb,
+                topic,
+                DEDUP_SIMILARITY_THRESHOLD,
+            ) {
+                let updated = Memory {
+                    id: existing.id.clone(),
+                    created_at: existing.created_at,
+                    last_accessed: existing.last_accessed,
+                    access_count: existing.access_count,
+                    weight: 1.0,
+                    topic: existing.topic.clone(),
+                    summary: content.to_string(),
+                    raw_excerpt: get_str(args, "raw_excerpt")
+                        .map(|r| r.into())
+                        .or_else(|| existing.raw_excerpt.clone()),
+                    keywords: {
+                        let kw = parse_keywords(args);
+                        if kw.is_empty() {
+                            existing.keywords.clone()
+                        } else {
+                            kw
+                        }
+                    },
+                    embedding: Some(query_emb.clone()),
+                    importance,
+                    source: existing.source.clone(),
+                    related_ids: existing.related_ids.clone(),
+                    updated_at: Utc::now(),
+                    scope: existing.scope,
+                    superseded_at: existing.superseded_at,
+                };
+                if let Err(e) = store.update(&updated) {
+                    return ToolResult::error(format!("failed to update: {e}"));
+                }
+                return if compact {
+                    ToolResult::text(format!("ok:{}", updated.id))
+                } else {
+                    ToolResult::text(format!(
+                        "Updated existing memory (similarity {score:.2}): {}",
+                        updated.id
+                    ))
+                };
             }
-            return if compact {
-                ToolResult::text(format!("ok:{}", updated.id))
-            } else {
-                ToolResult::text(format!(
-                    "Updated existing memory (similarity {score:.2}): {}",
-                    updated.id
-                ))
-            };
         }
     }
 

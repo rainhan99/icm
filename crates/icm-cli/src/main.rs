@@ -150,6 +150,11 @@ enum Commands {
         /// human terminal reading. `json` emits a parseable array.
         #[arg(short = 'f', long, default_value = "toon")]
         format: recall_format::RecallFormat,
+
+        /// Also surface superseded (historical) memories. Off by default:
+        /// recall returns only active memories (F-003).
+        #[arg(long)]
+        include_superseded: bool,
     },
 
     /// List memories
@@ -176,6 +181,11 @@ enum Commands {
         /// Maximum rows to return. Default: no limit.
         #[arg(short = 'l', long)]
         limit: Option<usize>,
+
+        /// Also list superseded (historical) memories. Off by default:
+        /// list shows only active memories (F-003).
+        #[arg(long)]
+        include_superseded: bool,
     },
 
     /// Forget (delete) a memory by ID, or all memories in a topic
@@ -1716,6 +1726,7 @@ fn main() -> Result<()> {
             keyword,
             project,
             format,
+            include_superseded,
         } => {
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_deref().map(|e| e as &dyn icm_core::Embedder);
@@ -1730,6 +1741,7 @@ fn main() -> Result<()> {
                 keyword.as_deref(),
                 project.as_deref(),
                 format,
+                include_superseded,
             )
         }
         Commands::List {
@@ -1738,7 +1750,16 @@ fn main() -> Result<()> {
             sort,
             format,
             limit,
-        } => cmd_list(&store, topic.as_deref(), all, sort, format, limit),
+            include_superseded,
+        } => cmd_list(
+            &store,
+            topic.as_deref(),
+            all,
+            sort,
+            format,
+            limit,
+            include_superseded,
+        ),
         Commands::Forget { id, topic } => cmd_forget(&store, id.as_deref(), topic.as_deref()),
         Commands::Update {
             id,
@@ -2100,7 +2121,21 @@ fn main() -> Result<()> {
                 // `embedder` is already a boxed trait object (F-001); the
                 // HTTP server takes ownership of the warm embedder and the
                 // cache metrics handle (for /cache).
-                return http_api::run_http_server(store, embedder, cache_metrics, addr, token);
+                // F-003: an empty [remote] tokens map means single-token
+                // (F-001) mode; a populated one enables token→tenant auth.
+                let tokens = if cfg.remote.tokens.is_empty() {
+                    None
+                } else {
+                    Some(cfg.remote.tokens.clone())
+                };
+                return http_api::run_http_server(
+                    store,
+                    embedder,
+                    cache_metrics,
+                    addr,
+                    token,
+                    tokens,
+                );
             }
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_deref().map(|e| e as &dyn icm_core::Embedder);
@@ -2263,43 +2298,62 @@ fn cmd_store(
         }
     }
 
-    // Dedup: if a very similar memory already exists in the same topic, update it instead
-    if let Some(ref emb) = memory.embedding {
-        if let Ok(Some((existing, score))) = find_similar_memory(
-            store,
-            &memory.embed_text(),
-            emb,
-            &topic,
-            DEDUP_SIMILARITY_THRESHOLD,
-        ) {
-            let updated = Memory {
-                id: existing.id.clone(),
-                created_at: existing.created_at,
-                updated_at: chrono::Utc::now(),
-                last_accessed: existing.last_accessed,
-                access_count: existing.access_count,
-                weight: 1.0,
-                topic: existing.topic.clone(),
-                summary: memory.summary.clone(),
-                raw_excerpt: memory.raw_excerpt.clone().or(existing.raw_excerpt),
-                keywords: if memory.keywords.is_empty() {
-                    existing.keywords
-                } else {
-                    memory.keywords.clone()
-                },
-                embedding: memory.embedding.clone(),
-                importance,
-                source: existing.source,
-                related_ids: existing.related_ids,
-                scope: existing.scope,
-            };
-            store.update(&updated)?;
-            println!(
-                "Updated existing memory (similarity {score:.2}): {}",
-                updated.id
-            );
-            maybe_auto_consolidate(store, embedder, &topic, memory_cfg);
-            return Ok(());
+    // F-003 supersession: a very-near-duplicate (>= supersede_threshold,
+    // stricter than dedup) marks the older same-topic memory superseded and
+    // stores the NEW one (temporal history), instead of merging in place.
+    // Disabled when threshold >= 1.0. Runs before the merge-dedup below.
+    let superseded_id = match memory.embedding.as_ref() {
+        Some(emb) => {
+            icm_core::supersede_similar(store, &topic, emb, memory_cfg.supersede_threshold)
+                .unwrap_or(None)
+        }
+        None => None,
+    };
+    if let Some(old) = &superseded_id {
+        println!("Superseded prior near-duplicate memory: {old}");
+    }
+
+    // Dedup: if a very similar memory already exists in the same topic, update
+    // it instead. Skipped when supersession already replaced an older row.
+    if superseded_id.is_none() {
+        if let Some(ref emb) = memory.embedding {
+            if let Ok(Some((existing, score))) = find_similar_memory(
+                store,
+                &memory.embed_text(),
+                emb,
+                &topic,
+                DEDUP_SIMILARITY_THRESHOLD,
+            ) {
+                let updated = Memory {
+                    id: existing.id.clone(),
+                    created_at: existing.created_at,
+                    updated_at: chrono::Utc::now(),
+                    last_accessed: existing.last_accessed,
+                    access_count: existing.access_count,
+                    weight: 1.0,
+                    topic: existing.topic.clone(),
+                    summary: memory.summary.clone(),
+                    raw_excerpt: memory.raw_excerpt.clone().or(existing.raw_excerpt),
+                    keywords: if memory.keywords.is_empty() {
+                        existing.keywords
+                    } else {
+                        memory.keywords.clone()
+                    },
+                    embedding: memory.embedding.clone(),
+                    importance,
+                    source: existing.source,
+                    related_ids: existing.related_ids,
+                    scope: existing.scope,
+                    superseded_at: existing.superseded_at,
+                };
+                store.update(&updated)?;
+                println!(
+                    "Updated existing memory (similarity {score:.2}): {}",
+                    updated.id
+                );
+                maybe_auto_consolidate(store, embedder, &topic, memory_cfg);
+                return Ok(());
+            }
         }
     }
 
@@ -2382,6 +2436,7 @@ fn cmd_recall(
     keyword: Option<&str>,
     project: Option<&str>,
     format: recall_format::RecallFormat,
+    include_superseded: bool,
 ) -> Result<()> {
     // Auto-decay if >24h since last decay
     if let Err(e) = store.maybe_auto_decay() {
@@ -2457,6 +2512,38 @@ fn cmd_recall(
     };
     final_results.retain(&filter);
 
+    // F-003: optionally fold in superseded (historical) memories. Off by
+    // default so recall stays active-only and byte-for-byte unchanged. This
+    // is an inspection affordance, not the hot path: it scans the superseded
+    // set, applies a lightweight query-token relevance test, and reuses the
+    // same project/topic/keyword filter. Superseded rows carry no relevance
+    // score (rendered as `None`) and fill the remaining `limit` slots after
+    // active matches — raise `--limit` to reveal more history.
+    if include_superseded {
+        let q = query.to_lowercase();
+        let q_tokens: Vec<String> = q.split_whitespace().map(str::to_string).collect();
+        let already: std::collections::HashSet<String> =
+            final_results.iter().map(|(m, _)| m.id.clone()).collect();
+        let extra: Vec<(Memory, Option<f32>)> = store
+            .list_all_including_superseded()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| !m.is_active() && !already.contains(&m.id))
+            .filter(|m| {
+                let hay =
+                    format!("{} {} {}", m.topic, m.summary, m.keywords.join(" ")).to_lowercase();
+                q_tokens.is_empty() || q_tokens.iter().any(|t| hay.contains(t.as_str()))
+            })
+            .map(|m| (m, None))
+            .collect();
+        for pair in extra {
+            if filter(&pair) {
+                final_results.push(pair);
+            }
+        }
+        final_results.truncate(limit);
+    }
+
     if final_results.is_empty() {
         // Audit #185 H8: don't short-circuit with a human-readable
         // message — that breaks the JSON / TOON contracts. Render
@@ -2490,11 +2577,26 @@ fn cmd_list(
     sort: SortField,
     format: ListFormat,
     limit: Option<usize>,
+    include_superseded: bool,
 ) -> Result<()> {
     let mut memories = if let Some(t) = topic {
-        store.get_by_topic(t)?
+        if include_superseded {
+            // No `get_by_topic` variant includes superseded; filter the
+            // include-all set by the same exact-topic match get_by_topic uses.
+            store
+                .list_all_including_superseded()?
+                .into_iter()
+                .filter(|m| m.topic == t)
+                .collect()
+        } else {
+            store.get_by_topic(t)?
+        }
     } else if all {
-        store.list_all()?
+        if include_superseded {
+            store.list_all_including_superseded()?
+        } else {
+            store.list_all()?
+        }
     } else {
         println!("Use --topic <name> or --all to list memories.");
         return Ok(());
@@ -10906,6 +11008,118 @@ mod cmd_memoir_tests {
         assert!(
             matches!(relation, CliRelation::DependsOn),
             "relation must map to depends-on"
+        );
+    }
+}
+
+#[cfg(test)]
+mod supersession_wired_tests {
+    use super::*;
+    use icm_core::{Embedder, IcmResult, Importance};
+
+    /// Constant embedder: every text maps to the same unit vector, so two
+    /// same-topic memories are treated as near-duplicates (cosine ≈ 1.0 >
+    /// the 0.90 supersede threshold). Deterministic and feature-independent
+    /// — the test does not require the `embeddings` model to be present.
+    struct ConstEmbedder;
+    impl Embedder for ConstEmbedder {
+        fn embed(&self, _text: &str) -> IcmResult<Vec<f32>> {
+            let n = 384_f32;
+            Ok(vec![1.0 / n.sqrt(); 384])
+        }
+        fn embed_batch(&self, texts: &[&str]) -> IcmResult<Vec<Vec<f32>>> {
+            texts.iter().map(|t| self.embed(t)).collect()
+        }
+        fn dimensions(&self) -> usize {
+            384
+        }
+    }
+
+    fn cfg(threshold: f32) -> crate::config::MemoryConfig {
+        crate::config::MemoryConfig {
+            supersede_threshold: threshold,
+            ..Default::default()
+        }
+    }
+
+    /// cmd_store must supersede a same-topic near-duplicate (not merge it):
+    /// the older row becomes inactive, the new row is stored, and history is
+    /// preserved — visible only via `list_all_including_superseded`.
+    #[test]
+    fn supersession_wired() {
+        let store = Store::in_memory_with_dims(384).unwrap();
+        let emb = ConstEmbedder;
+
+        cmd_store(
+            &store,
+            Some(&emb),
+            &cfg(0.90),
+            "context-icm".into(),
+            "The central serve node listens on port 7070".into(),
+            Importance::High,
+            None,
+            None,
+        )
+        .unwrap();
+
+        cmd_store(
+            &store,
+            Some(&emb),
+            &cfg(0.90),
+            "context-icm".into(),
+            "The central serve node listens on port 8080".into(),
+            Importance::High,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Default reads (what recall/list use) show only the active memory.
+        let active = store.list_all().unwrap();
+        assert_eq!(
+            active.len(),
+            1,
+            "superseded row must be excluded by default"
+        );
+        assert!(active[0].is_active());
+
+        // The include switch surfaces the superseded history too.
+        let all = store.list_all_including_superseded().unwrap();
+        assert_eq!(all.len(), 2, "include-superseded must reveal history");
+        assert_eq!(
+            all.iter().filter(|m| !m.is_active()).count(),
+            1,
+            "exactly one row is superseded"
+        );
+    }
+
+    /// threshold >= 1.0 disables supersession entirely: cmd_store behaves
+    /// like today (pure dedup). The backward-compat invariant is that NO
+    /// row is ever superseded — whether the hybrid dedup then merges is a
+    /// separate, score-dependent path and not asserted here.
+    #[test]
+    fn supersession_disabled_marks_nothing() {
+        let store = Store::in_memory_with_dims(384).unwrap();
+        let emb = ConstEmbedder;
+
+        for port in ["7070", "8080"] {
+            cmd_store(
+                &store,
+                Some(&emb),
+                &cfg(1.0),
+                "context-icm".into(),
+                format!("The central serve node listens on port {port}"),
+                Importance::High,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        let all = store.list_all_including_superseded().unwrap();
+        assert!(
+            all.iter().all(|m| m.is_active()),
+            "threshold >= 1.0 must supersede nothing"
         );
     }
 }

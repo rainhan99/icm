@@ -20,6 +20,18 @@ decay_rate = 0.95
 # Weight threshold for automatic pruning
 prune_threshold = 0.1
 
+# --- Supersession (F-003) ---
+# When storing a new memory, if an existing ACTIVE memory in the same topic
+# is at least this cosine-similar, the old one is marked "superseded" and the
+# new one is stored (temporal history preserved), instead of the two coexisting.
+# Superseded memories are hidden from recall/list by default; `--include-superseded`
+# reveals them. This is NEAR-DUPLICATE detection, not semantic-contradiction
+# detection (e.g. "lives in NYC" -> "moved to SF" has low similarity and is NOT
+# caught here — that needs an LLM, out of scope).
+# Range 0..1. Set >= 1.0 to DISABLE supersession entirely (behaves like today's
+# pure dedup — fully backward compatible). Default: 0.90.
+supersede_threshold = 0.90
+
 [embeddings]
 # Set to false to disable embeddings entirely (no model download, keyword search only)
 # enabled = false
@@ -109,3 +121,21 @@ transport = "stdio"
 
 # Custom instructions appended to MCP server description
 # instructions = "Always recall before starting work"
+
+# --- Remote server auth scaffold (F-003, `icm serve --http`) ---
+#
+# ⚠️  SCAFFOLD ONLY — resolves IDENTITY, does NOT isolate data.
+# A populated `tokens` map makes the HTTP server multi-tenant AWARE: it maps
+# each incoming `Authorization: Bearer <token>` to a tenant name, rejects
+# unknown tokens with 401, and logs/echoes (via GET /whoami) the resolved
+# tenant — never the token. But every tenant STILL SHARES ONE STORE: this does
+# NOT isolate one tenant's memories from another's. Cross-tenant data isolation
+# (Postgres row-level tenant + RLS) is deferred to F-003b. Do NOT deploy this
+# as a security boundary between mutually distrusting tenants.
+#
+# Leave empty (default) for F-001 single-token behavior: the one global
+# `--token` guards the server and /whoami reports tenant "default".
+#
+# [remote.tokens]
+# "s3cr3t-token-for-team-a" = "team-a"
+# "s3cr3t-token-for-team-b" = "team-b"

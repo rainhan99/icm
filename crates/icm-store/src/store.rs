@@ -839,12 +839,14 @@ fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         related_ids,
         embedding,
         scope: icm_core::Scope::User, // default for existing local memories
+        superseded_at: row.get::<_, Option<String>>(15)?.map(|s| parse_dt(&s)),
     })
 }
 
 const SELECT_COLS: &str = "id, created_at, updated_at, last_accessed, access_count, weight, \
                            topic, summary, raw_excerpt, keywords, \
-                           importance, source_type, source_data, related_ids, embedding";
+                           importance, source_type, source_data, related_ids, embedding, \
+                           superseded_at";
 
 /// Sanitize a query string for FTS5 MATCH.
 ///
@@ -1034,8 +1036,9 @@ impl SqliteStore {
             .execute(
                 "INSERT OR IGNORE INTO memories (id, created_at, updated_at, last_accessed, access_count, weight,
                  topic, summary, raw_excerpt, keywords,
-                 importance, source_type, source_data, related_ids, embedding, summary_hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                 importance, source_type, source_data, related_ids, embedding, summary_hash,
+                 superseded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
                     memory.id,
                     memory.created_at.to_rfc3339(),
@@ -1053,6 +1056,7 @@ impl SqliteStore {
                     related_json,
                     emb_blob,
                     hash,
+                    memory.superseded_at.map(|d| d.to_rfc3339()),
                 ],
             )
             .map_err(db_err)?;
@@ -1218,7 +1222,7 @@ impl MemoryStore for SqliteStore {
                  updated_at = ?2, last_accessed = ?3, access_count = ?4, weight = ?5,
                  topic = ?6, summary = ?7, raw_excerpt = ?8, keywords = ?9,
                  importance = ?10, source_type = ?11, source_data = ?12, related_ids = ?13,
-                 embedding = ?14, summary_hash = ?15
+                 embedding = ?14, summary_hash = ?15, superseded_at = ?16
                  WHERE id = ?1",
                 params![
                     memory.id,
@@ -1236,6 +1240,7 @@ impl MemoryStore for SqliteStore {
                     related_json,
                     emb_blob,
                     hash,
+                    memory.superseded_at.map(|d| d.to_rfc3339()),
                 ],
             )
             .map_err(db_err)?;
@@ -1297,7 +1302,7 @@ impl MemoryStore for SqliteStore {
         let where_clause = where_parts.join(" OR ");
 
         let query = format!(
-            "SELECT {SELECT_COLS} FROM memories WHERE {where_clause} ORDER BY weight DESC LIMIT ?{}",
+            "SELECT {SELECT_COLS} FROM memories WHERE superseded_at IS NULL AND ({where_clause}) ORDER BY weight DESC LIMIT ?{}",
             keywords.len() + 1
         );
 
@@ -1328,7 +1333,7 @@ impl MemoryStore for SqliteStore {
 
         let sql = format!(
             "SELECT {SELECT_COLS} FROM memories
-             WHERE id IN (
+             WHERE superseded_at IS NULL AND id IN (
                  SELECT id FROM memories_fts WHERE memories_fts MATCH ?1
              )
              ORDER BY weight DESC
@@ -1378,7 +1383,7 @@ impl MemoryStore for SqliteStore {
         // Batch fetch all memories in one query
         let placeholders: Vec<String> = (1..=knn_rows.len()).map(|i| format!("?{i}")).collect();
         let sql = format!(
-            "SELECT {SELECT_COLS} FROM memories WHERE id IN ({})",
+            "SELECT {SELECT_COLS} FROM memories WHERE superseded_at IS NULL AND id IN ({})",
             placeholders.join(", ")
         );
         let mut stmt = self.conn.prepare(&sql).map_err(db_err)?;
@@ -1416,14 +1421,19 @@ impl MemoryStore for SqliteStore {
         let sanitized = sanitize_fts_query(query);
 
         // 1. Get FTS results with rank scores
+        // NB: column list MUST match row_to_memory's index order (0..=15,
+        // with superseded_at at 15); fts.rank follows at index 16. The
+        // `AND m.superseded_at IS NULL` filter excludes superseded memories
+        // (F-003) at the memories join, not the FTS side.
         let fts_sql =
             "SELECT m.id, m.created_at, m.updated_at, m.last_accessed, m.access_count, m.weight, \
                     m.topic, m.summary, m.raw_excerpt, m.keywords, \
                     m.importance, m.source_type, m.source_data, m.related_ids, m.embedding, \
+                    m.superseded_at, \
                     fts.rank \
              FROM memories_fts fts \
              JOIN memories m ON m.id = fts.id \
-             WHERE memories_fts MATCH ?1 \
+             WHERE memories_fts MATCH ?1 AND m.superseded_at IS NULL \
              ORDER BY fts.rank \
              LIMIT ?2";
 
@@ -1434,7 +1444,7 @@ impl MemoryStore for SqliteStore {
             if let Ok(mut stmt) = self.conn.prepare(fts_sql) {
                 if let Ok(rows) = stmt.query_map(params![sanitized, pool_size as i64], |row| {
                     let memory = row_to_memory(row)?;
-                    let rank: f32 = row.get(15)?;
+                    let rank: f32 = row.get(16)?;
                     Ok((memory, rank))
                 }) {
                     for row in rows.flatten() {
@@ -1606,7 +1616,7 @@ impl MemoryStore for SqliteStore {
         let mut stmt = self
             .conn
             .prepare(&format!(
-                "SELECT {SELECT_COLS} FROM memories WHERE topic = ?1 ORDER BY weight DESC LIMIT 500"
+                "SELECT {SELECT_COLS} FROM memories WHERE topic = ?1 AND superseded_at IS NULL ORDER BY weight DESC LIMIT 500"
             ))
             .map_err(db_err)?;
 
@@ -1621,6 +1631,20 @@ impl MemoryStore for SqliteStore {
         let mut stmt = self
             .conn
             .prepare(&format!(
+                "SELECT {SELECT_COLS} FROM memories WHERE superseded_at IS NULL ORDER BY weight DESC LIMIT 10000"
+            ))
+            .map_err(db_err)?;
+
+        let rows = stmt.query_map([], row_to_memory).map_err(db_err)?;
+        collect_rows(rows)
+    }
+
+    fn list_all_including_superseded(&self) -> IcmResult<Vec<Memory>> {
+        // Same as `list_all` but WITHOUT the `superseded_at IS NULL`
+        // predicate, so the caller can inspect temporal history.
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
                 "SELECT {SELECT_COLS} FROM memories ORDER BY weight DESC LIMIT 10000"
             ))
             .map_err(db_err)?;
@@ -1632,7 +1656,7 @@ impl MemoryStore for SqliteStore {
     fn list_topics(&self) -> IcmResult<Vec<(String, usize)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT topic, COUNT(*) FROM memories GROUP BY topic ORDER BY topic")
+            .prepare("SELECT topic, COUNT(*) FROM memories WHERE superseded_at IS NULL GROUP BY topic ORDER BY topic")
             .map_err(db_err)?;
 
         let rows = stmt
@@ -1696,16 +1720,18 @@ impl MemoryStore for SqliteStore {
 
     fn count(&self) -> IcmResult<usize> {
         self.conn
-            .query_row("SELECT COUNT(*) FROM memories", [], |row| {
-                row.get::<_, usize>(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE superseded_at IS NULL",
+                [],
+                |row| row.get::<_, usize>(0),
+            )
             .map_err(|e| IcmError::Database(e.to_string()))
     }
 
     fn count_by_topic(&self, topic: &str) -> IcmResult<usize> {
         self.conn
             .query_row(
-                "SELECT COUNT(*) FROM memories WHERE topic = ?1",
+                "SELECT COUNT(*) FROM memories WHERE topic = ?1 AND superseded_at IS NULL",
                 params![topic],
                 |row| row.get::<_, usize>(0),
             )
@@ -1726,7 +1752,7 @@ impl MemoryStore for SqliteStore {
                     SUM(CASE WHEN weight < 0.5
                          AND julianday('now') - julianday(last_accessed) > 14
                          THEN 1 ELSE 0 END)
-                 FROM memories WHERE topic = ?1",
+                 FROM memories WHERE topic = ?1 AND superseded_at IS NULL",
                 params![topic],
                 |row| {
                     Ok((
@@ -3972,6 +3998,104 @@ mod tests {
             IcmError::Database(_) | IcmError::ReadOnly(_) => {}
             other => panic!("expected Database or ReadOnly, got {other:?}"),
         }
+    }
+
+    // === Memory supersession (F-003) ===
+
+    #[test]
+    fn memory_superseded_persist() {
+        use icm_core::{Importance, Memory, MemoryStore};
+        let s = SqliteStore::in_memory_with_dims(384).unwrap();
+        let mut m = Memory::new(
+            "profile".to_string(),
+            "user lives in NYC".to_string(),
+            Importance::Medium,
+        );
+        let id = s.store(m.clone()).unwrap();
+        m.id = id.clone();
+        // Mark superseded via the existing update() path (no new trait method).
+        m.superseded_at = Some(chrono::Utc::now());
+        s.update(&m).unwrap();
+        let got = s.get(&id).unwrap().unwrap();
+        assert!(got.superseded_at.is_some(), "superseded_at persisted");
+        assert!(!got.is_active());
+    }
+
+    #[test]
+    fn reads_exclude_superseded() {
+        use icm_core::{Importance, Memory, MemoryStore};
+        let s = SqliteStore::in_memory_with_dims(384).unwrap();
+        let a = Memory::new(
+            "t".to_string(),
+            "alpha keeps".to_string(),
+            Importance::Medium,
+        );
+        let b = Memory::new("t".to_string(), "beta gone".to_string(), Importance::Medium);
+        let _ida = s.store(a).unwrap();
+        let idb = s.store(b).unwrap();
+        let mut b2 = s.get(&idb).unwrap().unwrap();
+        b2.superseded_at = Some(chrono::Utc::now());
+        s.update(&b2).unwrap();
+
+        // Recall/list/count exclude the superseded memory.
+        assert_eq!(s.count().unwrap(), 1, "count excludes superseded");
+        assert_eq!(s.count_by_topic("t").unwrap(), 1);
+        assert_eq!(s.list_all().unwrap().len(), 1);
+        assert_eq!(s.get_by_topic("t").unwrap().len(), 1);
+        assert!(
+            s.search_fts("beta", 5).unwrap().iter().all(|m| m.id != idb),
+            "superseded beta excluded from FTS"
+        );
+        assert_eq!(s.search_fts("alpha", 5).unwrap().len(), 1);
+        // Direct get(id) still returns a superseded memory (auditable).
+        assert!(s.get(&idb).unwrap().is_some());
+    }
+
+    #[test]
+    fn supersede_similar_marks_old() {
+        use icm_core::{supersede_similar, Importance, Memory, MemoryStore};
+        let s = SqliteStore::in_memory_with_dims(384).unwrap();
+        // Existing active memory with a known embedding.
+        let mut old = Memory::new(
+            "profile".to_string(),
+            "dark mode preferred".to_string(),
+            Importance::Medium,
+        );
+        old.embedding = Some(vec![1.0_f32; 384]);
+        let old_id = s.store(old).unwrap();
+
+        // A near-duplicate (same topic + same embedding) about to be stored.
+        let mut new = Memory::new(
+            "profile".to_string(),
+            "dark mode preferred setting".to_string(),
+            Importance::Medium,
+        );
+        new.embedding = Some(vec![1.0_f32; 384]);
+
+        // Identical embedding (cosine 1.0) → supersedes at the 0.90 default.
+        let superseded =
+            supersede_similar(&s, &new.topic, new.embedding.as_ref().unwrap(), 0.90).unwrap();
+        assert_eq!(superseded.as_deref(), Some(old_id.as_str()));
+        assert!(
+            !s.get(&old_id).unwrap().unwrap().is_active(),
+            "old marked superseded"
+        );
+    }
+
+    #[test]
+    fn supersede_disabled_at_threshold_one() {
+        use icm_core::{supersede_similar, Importance, Memory, MemoryStore};
+        let s = SqliteStore::in_memory_with_dims(384).unwrap();
+        let mut old = Memory::new("profile".to_string(), "x".to_string(), Importance::Medium);
+        old.embedding = Some(vec![1.0_f32; 384]);
+        let old_id = s.store(old).unwrap();
+        // threshold >= 1.0 disables supersession entirely (today's behavior).
+        let r = supersede_similar(&s, "profile", &vec![1.0_f32; 384], 1.0).unwrap();
+        assert!(r.is_none());
+        assert!(
+            s.get(&old_id).unwrap().unwrap().is_active(),
+            "old still active"
+        );
     }
 
     // === Embedding dimension guard (F-001) ===

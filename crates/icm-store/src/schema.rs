@@ -68,7 +68,11 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
             -- SHA-256 over normalize(topic + '\\0' + summary). Used by
             -- INSERT OR IGNORE dedup. NULL on rows that predate the
             -- migration (existing duplicates intentionally untouched).
-            summary_hash TEXT
+            summary_hash TEXT,
+            -- RFC3339 timestamp when this memory was superseded by a newer
+            -- near-duplicate (F-003). NULL = active. Excluded from
+            -- recall/list by default.
+            superseded_at TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_memories_topic ON memories(topic);
@@ -130,6 +134,15 @@ pub fn init_db_with_dims(conn: &Connection, embedding_dims: usize) -> Result<(),
     // the dedup feature. SQLite has no `ADD COLUMN IF NOT EXISTS`, so we
     // try the ALTER and ignore the "duplicate column name" error.
     if let Err(e) = conn.execute("ALTER TABLE memories ADD COLUMN summary_hash TEXT", []) {
+        let msg = e.to_string();
+        if !msg.contains("duplicate column name") {
+            return Err(db_err(e));
+        }
+    }
+    // Migration (F-003): add `superseded_at` to pre-F-003 DBs. Same
+    // ignore-duplicate-column dance. Existing memories default to NULL =
+    // active, so recall behaviour is unchanged.
+    if let Err(e) = conn.execute("ALTER TABLE memories ADD COLUMN superseded_at TEXT", []) {
         let msg = e.to_string();
         if !msg.contains("duplicate column name") {
             return Err(db_err(e));
