@@ -15,6 +15,7 @@ use tree_sitter::{Node, Parser};
 use crate::code_graph::{CodeLanguage, Ref, Symbol};
 use crate::error::{IcmError, IcmResult};
 
+mod go;
 mod python;
 mod rust;
 mod typescript;
@@ -55,9 +56,7 @@ pub fn parse_file(language: CodeLanguage, rel_path: &str, source: &str) -> IcmRe
             typescript::extract(root, source, rel_path, language)
         }
         CodeLanguage::Python => python::extract(root, source, rel_path),
-        // Remaining languages land in later tasks; empty until then.
-        #[allow(unreachable_patterns)]
-        _ => (Vec::new(), Vec::new()),
+        CodeLanguage::Go => go::extract(root, source, rel_path),
     };
     Ok(ParsedFile { symbols, refs })
 }
@@ -115,6 +114,17 @@ mod tests {
         assert_eq!(get("foo").map(|s| s.kind), Some(SymbolKind::Function));
         assert_eq!(get("Bar").map(|s| s.kind), Some(SymbolKind::Class));
         assert_eq!(get("m").map(|s| s.kind), Some(SymbolKind::Method));
+    }
+
+    #[test]
+    fn go_extracts_func_method_struct_interface() {
+        let src = "package p\nfunc Foo(){}\nfunc (r R) Bar(){}\ntype Baz struct{}\ntype Q interface{}\n";
+        let parsed = parse_file(CodeLanguage::Go, "a.go", src).expect("parse");
+        let get = |n: &str| parsed.symbols.iter().find(|s| s.name == n).map(|s| s.kind);
+        assert_eq!(get("Foo"), Some(SymbolKind::Function));
+        assert_eq!(get("Bar"), Some(SymbolKind::Method));
+        assert_eq!(get("Baz"), Some(SymbolKind::Struct));
+        assert_eq!(get("Q"), Some(SymbolKind::Interface));
     }
 
     #[test]
