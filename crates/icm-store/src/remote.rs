@@ -13,15 +13,24 @@
 
 use std::collections::HashMap;
 
+use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
 use icm_core::{
-    Concept, ConceptLink, Fact, FactsStats, FactsStore, Feedback, FeedbackStats, FeedbackStore,
-    IcmError, IcmResult, Label, Memoir, MemoirStats, MemoirStore, Memory, MemoryStore, Message,
-    Relation, Role, RpcRequest, RpcResponse, Session, StoreStats, TopicHealth, TranscriptHit,
-    TranscriptStats, TranscriptStore,
+    Concept, ConceptLink, Embedder, Fact, FactsStats, FactsStore, Feedback, FeedbackStats,
+    FeedbackStore, IcmError, IcmResult, Label, Memoir, MemoirStats, MemoirStore, Memory,
+    MemoryStore, Message, PatternCluster, Relation, Role, RpcRequest, RpcResponse, Session,
+    StoreStats, TopicHealth, TranscriptHit, TranscriptStats, TranscriptStore,
 };
+
+use crate::common::{CodeArea, HookEvent, HookEventInsert, HookStatsRow, PendingRow};
+
+/// Build the standard "not available in remote mode" error for the
+/// node-local operational surface (F-001, authorized simplification).
+fn remote_unsupported(op: &str) -> IcmError {
+    IcmError::Unsupported(format!("{op} is a node-local operation, unavailable in remote mode"))
+}
 
 /// A store backed by a remote `icm serve --http` node.
 pub struct RemoteHttpStore {
@@ -494,6 +503,175 @@ impl TranscriptStore for RemoteHttpStore {
 
     fn transcript_stats(&self) -> IcmResult<TranscriptStats> {
         self.call_de("transcript.transcript_stats", json!({}))
+    }
+}
+
+// --- Inherent Store surface (F-001, authorized layered handling) ---------
+//
+// The `Store` enum forwards ~24 inherent (non-trait) methods via its
+// `dispatch!` macro, so `RemoteHttpStore` must provide them. Per the
+// user-authorized strategy (logged in the plan's Logic Completeness
+// Manifest):
+//   • must-not-error operational calls degrade to safe no-ops;
+//   • memory-semantic helpers are composed client-side from the trait
+//     RPCs already forwarded;
+//   • node-local bookkeeping (hook counters/events, code areas, pending
+//     extraction) returns `Unsupported` — callers on the hook hot path
+//     already swallow these errors (`let _ = …`, `.unwrap_or(…)`).
+impl RemoteHttpStore {
+    /// The remote node owns its own storage lock; the client is not
+    /// read-only.
+    pub fn is_readonly(&self) -> bool {
+        false
+    }
+
+    /// Decay is applied server-side; a thin client is a no-op.
+    pub fn maybe_auto_decay(&self) -> IcmResult<()> {
+        Ok(())
+    }
+
+    // -- node-local bookkeeping: Unsupported (hook path swallows errors) --
+    pub fn increment_hook_counter(&self) -> IcmResult<usize> {
+        Err(remote_unsupported("increment_hook_counter"))
+    }
+    pub fn reset_hook_counter(&self) -> IcmResult<()> {
+        Err(remote_unsupported("reset_hook_counter"))
+    }
+    pub fn enqueue_pending_extraction(
+        &self,
+        _project: &str,
+        _tool_name: &str,
+        _raw_output: &str,
+    ) -> IcmResult<String> {
+        Err(remote_unsupported("enqueue_pending_extraction"))
+    }
+    pub fn list_pending_extractions(&self, _limit: usize) -> IcmResult<Vec<PendingRow>> {
+        Err(remote_unsupported("list_pending_extractions"))
+    }
+    pub fn delete_pending_extractions(&self, _ids: &[String]) -> IcmResult<usize> {
+        Err(remote_unsupported("delete_pending_extractions"))
+    }
+    pub fn pending_extraction_count(&self) -> IcmResult<usize> {
+        Err(remote_unsupported("pending_extraction_count"))
+    }
+    pub fn upsert_code_area(
+        &self,
+        _project: &str,
+        _file_path: &str,
+        _description: Option<&str>,
+        _session_id: Option<&str>,
+        _tool_name: Option<&str>,
+    ) -> IcmResult<()> {
+        Err(remote_unsupported("upsert_code_area"))
+    }
+    pub fn list_code_areas(
+        &self,
+        _project: Option<&str>,
+        _in_file: Option<&str>,
+        _since: Option<DateTime<Utc>>,
+        _limit: usize,
+    ) -> IcmResult<Vec<CodeArea>> {
+        Err(remote_unsupported("list_code_areas"))
+    }
+    pub fn code_area_count(&self) -> IcmResult<usize> {
+        Err(remote_unsupported("code_area_count"))
+    }
+    pub fn record_hook_event(&self, _ev: &HookEventInsert) -> IcmResult<i64> {
+        Err(remote_unsupported("record_hook_event"))
+    }
+    pub fn hook_events_recent(
+        &self,
+        _limit: usize,
+        _event_filter: Option<&str>,
+    ) -> IcmResult<Vec<HookEvent>> {
+        Err(remote_unsupported("hook_events_recent"))
+    }
+    pub fn hook_stats(&self, _since_rfc3339: &str) -> IcmResult<Vec<HookStatsRow>> {
+        Err(remote_unsupported("hook_stats"))
+    }
+    pub fn prune_hook_events(&self, _cutoff_rfc3339: &str) -> IcmResult<usize> {
+        Err(remote_unsupported("prune_hook_events"))
+    }
+    pub fn hook_event_count(&self) -> IcmResult<usize> {
+        Err(remote_unsupported("hook_event_count"))
+    }
+
+    // -- memory-semantic: composed client-side / safe no-ops --------------
+
+    /// Opportunistic auto-consolidation is a server concern; report "no
+    /// consolidation happened" rather than erroring on the store hot path.
+    pub fn auto_consolidate(&self, _topic: &str, _threshold: usize) -> IcmResult<bool> {
+        Ok(false)
+    }
+    pub fn auto_consolidate_with_embedder(
+        &self,
+        _topic: &str,
+        _threshold: usize,
+        _embedder: Option<&dyn Embedder>,
+    ) -> IcmResult<bool> {
+        Ok(false)
+    }
+
+    /// Neighbor expansion (memoir graph) is not forwarded; return the
+    /// initial set unchanged so recall still returns its base hits.
+    pub fn expand_with_neighbors(
+        &self,
+        initial: &[(Memory, f32)],
+        _max_neighbors: usize,
+        _hop_discount: f32,
+        _max_total: usize,
+    ) -> IcmResult<Vec<(Memory, f32)>> {
+        Ok(initial.to_vec())
+    }
+
+    /// Composed from `memory.get` calls.
+    pub fn get_many(&self, ids: &[&str]) -> IcmResult<HashMap<String, Memory>> {
+        let mut out = HashMap::new();
+        for id in ids {
+            if let Some(m) = self.get(id)? {
+                out.insert(m.id.clone(), m);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Composed client-side from `memory.list_all` + prefix filter.
+    pub fn get_by_topic_prefix(&self, topic: &str) -> IcmResult<Vec<Memory>> {
+        Ok(self
+            .list_all()?
+            .into_iter()
+            .filter(|m| m.topic.starts_with(topic))
+            .collect())
+    }
+
+    /// Composed client-side from `memory.list_topics` + prefix filter.
+    pub fn list_topics_with_prefix(
+        &self,
+        prefix: Option<&str>,
+    ) -> IcmResult<Vec<(String, usize)>> {
+        let topics = self.list_topics()?;
+        Ok(match prefix {
+            Some(p) => topics
+                .into_iter()
+                .filter(|(t, _)| t.starts_with(p))
+                .collect(),
+            None => topics,
+        })
+    }
+
+    pub fn detect_patterns(
+        &self,
+        _topic: &str,
+        _min_cluster_size: usize,
+    ) -> IcmResult<Vec<PatternCluster>> {
+        Err(remote_unsupported("detect_patterns"))
+    }
+    pub fn extract_pattern_as_concept(
+        &self,
+        _cluster: &PatternCluster,
+        _memoir_id: &str,
+    ) -> IcmResult<String> {
+        Err(remote_unsupported("extract_pattern_as_concept"))
     }
 }
 

@@ -457,7 +457,15 @@ fn remote_mode_disables_local_embedder() {
 
 ## 9. Logic Completeness Manifest
 
-**Every requirement in the linked spec MUST be implemented in full. Authorized simplifications: (none).**
+**Every requirement in the linked spec MUST be implemented in full.**
+
+**Authorized simplifications:**
+
+- **Simplification:** `RemoteHttpStore` does NOT forward the `Store` enum's ~24 *inherent* (non-trait) methods to the server. Instead: must-not-error operational calls (`maybe_auto_decay`, `is_readonly`, `auto_consolidate*`, `expand_with_neighbors`) degrade to safe no-ops; memory-semantic helpers (`get_many`, `get_by_topic_prefix`, `list_topics_with_prefix`) are composed client-side from the trait RPCs; node-local bookkeeping (hook counters/events, code areas, pending-extraction queue, `detect_patterns`, `extract_pattern_as_concept`) returns `IcmError::Unsupported`.
+  - **Reason:** The plan scoped the 67 store-*trait* methods (decision A) but not the enum's inherent surface, discovered at T14/T15. The hook hot path already swallows these errors (`let _ = …`, `.unwrap_or(…)`), so recall/store over remote work fully; only cross-machine centralization of hook bookkeeping / code-areas / pattern mining is deferred. User chose the layered strategy over full forwarding (~16 extra RPC methods) or re-planning.
+  - **Approved by:** rainhan@coupert.com
+  - **Approved at:** 2026-07-22
+  - **Restoration ticket:** F-001 follow-up — "forward remote inherent surface (hook bookkeeping, code_areas, pattern mining) for cross-machine centralization".
 
 > 说明:spec `## Out of scope`(内置 TLS、多用户鉴权、自动 re-embed、补建 SPA)是**已批准的范围边界**,非对范围内 SC 的简化,故不计入本 Manifest 的简化条目。
 

@@ -29,28 +29,37 @@ use crate::postgres::PostgresStore;
 #[cfg(feature = "opensearch")]
 use crate::opensearch::OpenSearchStore;
 
+#[cfg(feature = "remote-store")]
+use crate::remote::RemoteHttpStore;
+
 /// Which storage backend is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
     Sqlite,
     Postgres,
     OpenSearch,
+    /// Thin client of a central `icm serve --http` node (F-001). Holds no
+    /// local DB or embedder; every call is forwarded over JSON-RPC.
+    Remote,
 }
 
 impl BackendKind {
     /// Resolve the requested backend from `ICM_DB_BACKEND` (default
     /// `sqlite`). Unknown values are a config error.
     pub fn from_env() -> IcmResult<Self> {
-        match std::env::var("ICM_DB_BACKEND")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-        {
+        Self::parse(std::env::var("ICM_DB_BACKEND").ok().as_deref())
+    }
+
+    /// Pure parser for the `ICM_DB_BACKEND` value (testable without
+    /// mutating the process environment).
+    pub fn parse(value: Option<&str>) -> IcmResult<Self> {
+        match value.map(str::trim) {
             None | Some("") | Some("sqlite") => Ok(BackendKind::Sqlite),
             Some("postgres") | Some("postgresql") | Some("pg") => Ok(BackendKind::Postgres),
             Some("opensearch") | Some("os") => Ok(BackendKind::OpenSearch),
+            Some("remote") | Some("http") => Ok(BackendKind::Remote),
             Some(other) => Err(IcmError::Config(format!(
-                "unknown ICM_DB_BACKEND '{other}' (expected: sqlite, postgres, opensearch)"
+                "unknown ICM_DB_BACKEND '{other}' (expected: sqlite, postgres, opensearch, remote)"
             ))),
         }
     }
@@ -65,6 +74,8 @@ pub enum Store {
     Postgres(PostgresStore),
     #[cfg(feature = "opensearch")]
     OpenSearch(OpenSearchStore),
+    #[cfg(feature = "remote-store")]
+    Remote(RemoteHttpStore),
 }
 
 /// Forward a method call to the active backend variant.
@@ -77,6 +88,8 @@ macro_rules! dispatch {
             Store::Postgres(s) => s.$m($($a),*),
             #[cfg(feature = "opensearch")]
             Store::OpenSearch(s) => s.$m($($a),*),
+            #[cfg(feature = "remote-store")]
+            Store::Remote(s) => s.$m($($a),*),
         }
     };
 }
@@ -89,6 +102,21 @@ fn not_compiled(name: &str) -> IcmError {
         "the '{name}' backend was requested (ICM_DB_BACKEND) but this build was \
          not compiled with its Cargo feature"
     ))
+}
+
+/// Build a [`RemoteHttpStore`] from the environment: `ICM_REMOTE_URL`
+/// (required) + `ICM_REMOTE_TOKEN` (optional). F-001.
+#[cfg(feature = "remote-store")]
+fn remote_from_env() -> IcmResult<RemoteHttpStore> {
+    let url = std::env::var("ICM_REMOTE_URL").map_err(|_| {
+        IcmError::Config(
+            "ICM_DB_BACKEND=remote requires ICM_REMOTE_URL (e.g. http://host:11435)".to_string(),
+        )
+    })?;
+    let token = std::env::var("ICM_REMOTE_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    Ok(RemoteHttpStore::new(&url, token))
 }
 
 impl Store {
@@ -141,6 +169,18 @@ impl Store {
                     Err(not_compiled("opensearch"))
                 }
             }
+            BackendKind::Remote => {
+                #[cfg(feature = "remote-store")]
+                {
+                    let _ = (path, embedding_dims);
+                    Ok(Store::Remote(remote_from_env()?))
+                }
+                #[cfg(not(feature = "remote-store"))]
+                {
+                    let _ = (path, embedding_dims);
+                    Err(not_compiled("remote"))
+                }
+            }
         }
     }
 
@@ -178,6 +218,20 @@ impl Store {
                 {
                     let _ = path;
                     Err(not_compiled("opensearch"))
+                }
+            }
+            BackendKind::Remote => {
+                // Read-only is a server-side concern for a remote store;
+                // the client is the same either way (the server enforces).
+                #[cfg(feature = "remote-store")]
+                {
+                    let _ = path;
+                    Ok(Store::Remote(remote_from_env()?))
+                }
+                #[cfg(not(feature = "remote-store"))]
+                {
+                    let _ = path;
+                    Err(not_compiled("remote"))
                 }
             }
         }
@@ -231,6 +285,18 @@ impl Store {
                     Err(not_compiled("opensearch"))
                 }
             }
+            BackendKind::Remote => {
+                #[cfg(feature = "remote-store")]
+                {
+                    let _ = embedding_dims;
+                    Ok(Store::Remote(remote_from_env()?))
+                }
+                #[cfg(not(feature = "remote-store"))]
+                {
+                    let _ = embedding_dims;
+                    Err(not_compiled("remote"))
+                }
+            }
         }
     }
 
@@ -269,6 +335,11 @@ impl Store {
                     let _ = path;
                     Ok(None)
                 }
+            }
+            BackendKind::Remote => {
+                // Dims live on the remote node; not knowable locally.
+                let _ = path;
+                Ok(None)
             }
         }
     }
@@ -684,5 +755,29 @@ impl TranscriptStore for Store {
     }
     fn transcript_stats(&self) -> IcmResult<TranscriptStats> {
         dispatch!(self, transcript_stats())
+    }
+}
+
+#[cfg(test)]
+mod backend_kind_tests {
+    use super::BackendKind;
+
+    #[test]
+    fn remote_backend_from_env() {
+        assert_eq!(
+            BackendKind::parse(Some("remote")).unwrap(),
+            BackendKind::Remote
+        );
+        assert_eq!(BackendKind::parse(Some("http")).unwrap(), BackendKind::Remote);
+    }
+
+    #[test]
+    fn defaults_and_unknown() {
+        assert_eq!(BackendKind::parse(None).unwrap(), BackendKind::Sqlite);
+        assert_eq!(
+            BackendKind::parse(Some("sqlite")).unwrap(),
+            BackendKind::Sqlite
+        );
+        assert!(BackendKind::parse(Some("bogus")).is_err());
     }
 }
