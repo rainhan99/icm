@@ -1411,6 +1411,22 @@ fn resolve_embedding_dims(
     }
 }
 
+/// Decide whether a local embedder should be loaded this run. Remote
+/// clients (F-001) never embed locally — the central `icm serve` node
+/// owns embedding, so the thin client stays zero-model. Otherwise honor
+/// the config toggle and the `--no-embeddings` flag. (`ICM_NO_EMBEDDINGS`
+/// is applied by the caller.)
+fn compute_embeddings_enabled(
+    cfg_enabled: bool,
+    cli_no_embeddings: bool,
+    backend: icm_store::BackendKind,
+) -> bool {
+    if matches!(backend, icm_store::BackendKind::Remote) {
+        return false;
+    }
+    cfg_enabled && !cli_no_embeddings
+}
+
 /// Embedder provider selected from `[embeddings] provider` (F-001).
 #[derive(Debug, PartialEq, Eq)]
 enum EmbedderKind {
@@ -1540,6 +1556,17 @@ mod embedder_kind_tests {
             EmbedderKind::Local
         );
     }
+
+    #[test]
+    fn remote_mode_disables_local_embedder() {
+        use icm_store::BackendKind;
+        // Remote client: never load a local model, even if config enables it.
+        assert!(!compute_embeddings_enabled(true, false, BackendKind::Remote));
+        // Local backends keep the normal behavior.
+        assert!(compute_embeddings_enabled(true, false, BackendKind::Sqlite));
+        assert!(!compute_embeddings_enabled(false, false, BackendKind::Sqlite));
+        assert!(!compute_embeddings_enabled(true, true, BackendKind::Sqlite));
+    }
 }
 
 fn main() -> Result<()> {
@@ -1559,8 +1586,15 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let cfg = config::load_config()?;
-    let embeddings_enabled =
-        cfg.embeddings.enabled && !cli.no_embeddings && std::env::var("ICM_NO_EMBEDDINGS").is_err();
+    // Remote clients must not load a local embedding model (F-001): the
+    // central server owns embedding, keeping the client zero-model.
+    let active_backend =
+        icm_store::BackendKind::from_env().unwrap_or(icm_store::BackendKind::Sqlite);
+    let embeddings_enabled = compute_embeddings_enabled(
+        cfg.embeddings.enabled,
+        cli.no_embeddings,
+        active_backend,
+    ) && std::env::var("ICM_NO_EMBEDDINGS").is_err();
     #[allow(unused_variables)]
     let embedder: Option<Box<dyn icm_core::Embedder + Send + Sync>> = if embeddings_enabled {
         build_embedder(&cfg)
