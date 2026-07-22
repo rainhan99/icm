@@ -357,6 +357,60 @@ mod tests {
         assert_eq!(s.code_stats().unwrap().symbols, 1);
     }
 
+    /// Index a resolved call chain a -> b -> c in one file.
+    fn chain_store() -> SqliteStore {
+        let s = store();
+        let a = sym("f#a@1", "a", SymbolKind::Function, "f.rs", 1);
+        let b = sym("f#b@2", "b", SymbolKind::Function, "f.rs", 2);
+        let c = sym("f#c@3", "c", SymbolKind::Function, "f.rs", 3);
+        let r = |from: &Symbol, to: &Symbol| Ref {
+            from_symbol: from.id.clone(),
+            target_name: to.name.clone(),
+            target_symbol: Some(to.id.clone()),
+            kind: RefKind::Call,
+            line: from.start_line,
+        };
+        let refs = vec![r(&a, &b), r(&b, &c)];
+        let file = CodeFile {
+            path: "f.rs".into(),
+            language: CodeLanguage::Rust,
+            content_hash: "h".into(),
+            stale: false,
+        };
+        s.index_file(&file, &[a, b, c], &refs).unwrap();
+        s
+    }
+
+    #[test]
+    fn explore_returns_callers_callees_and_blast_radius() {
+        let s = chain_store();
+        let res = s.explore("c", 5).unwrap().expect("c found");
+        assert_eq!(res.symbol.name, "c");
+        assert!(res.source.is_none(), "store-level explore leaves source to CLI/MCP");
+        // c is called directly by b.
+        assert_eq!(res.callers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["b"]);
+        assert!(res.callees.is_empty());
+        // Transitive callers of c: b (depth 1) and a (depth 2).
+        let mut blast: Vec<_> = res.blast_radius.iter().map(|s| s.name.clone()).collect();
+        blast.sort();
+        assert_eq!(blast, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn explore_blast_radius_respects_depth() {
+        let s = chain_store();
+        let res = s.explore("c", 1).unwrap().unwrap();
+        // Depth 1: only the direct caller b, not a.
+        let blast: Vec<_> = res.blast_radius.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(blast, vec!["b"]);
+    }
+
+    #[test]
+    fn explore_unknown_symbol_is_none() {
+        let s = store();
+        assert!(s.explore("nope", 3).unwrap().is_none());
+    }
+
     #[test]
     fn delete_file_clears_rows() {
         let s = store();
