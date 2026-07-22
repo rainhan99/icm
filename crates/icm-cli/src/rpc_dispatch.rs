@@ -25,6 +25,9 @@ use icm_core::{
 };
 use icm_store::Store;
 
+#[cfg(feature = "code-graph")]
+use icm_core::CodeGraphStore;
+
 // --- param helpers -------------------------------------------------------
 
 fn want_str(p: &Value, k: &str) -> IcmResult<String> {
@@ -356,6 +359,47 @@ fn dispatch_inner(
         }
         "transcript.transcript_stats" => as_value(store.transcript_stats()?),
 
+        // --- CodeGraphStore (F-002) ---
+        #[cfg(feature = "code-graph")]
+        "code.index_file" => {
+            let file: icm_core::CodeFile = want_val(p, "file")?;
+            let symbols: Vec<icm_core::Symbol> = want_val(p, "symbols")?;
+            let refs: Vec<icm_core::Ref> = want_val(p, "refs")?;
+            store.index_file(&file, &symbols, &refs)?;
+            Ok(Value::Null)
+        }
+        #[cfg(feature = "code-graph")]
+        "code.delete_file" => {
+            store.delete_file(&want_str(p, "path")?)?;
+            Ok(Value::Null)
+        }
+        #[cfg(feature = "code-graph")]
+        "code.file_hash" => as_value(store.file_hash(&want_str(p, "path")?)?),
+        #[cfg(feature = "code-graph")]
+        "code.get_symbol" => as_value(store.get_symbol(&want_str(p, "id")?)?),
+        #[cfg(feature = "code-graph")]
+        "code.find_symbols" => {
+            as_value(store.find_symbols(&want_str(p, "name")?, opt_usize(p, "limit", 10))?)
+        }
+        #[cfg(feature = "code-graph")]
+        "code.callers" => as_value(store.callers(&want_str(p, "symbol_id")?)?),
+        #[cfg(feature = "code-graph")]
+        "code.callees" => as_value(store.callees(&want_str(p, "symbol_id")?)?),
+        #[cfg(feature = "code-graph")]
+        "code.explore" => {
+            as_value(store.explore(&want_str(p, "name")?, opt_usize(p, "max_depth", 3))?)
+        }
+        #[cfg(feature = "code-graph")]
+        "code.list_stale" => as_value(store.list_stale()?),
+        #[cfg(feature = "code-graph")]
+        "code.mark_stale" => {
+            let paths: Vec<String> = want_val(p, "paths")?;
+            store.mark_stale(&paths)?;
+            Ok(Value::Null)
+        }
+        #[cfg(feature = "code-graph")]
+        "code.code_stats" => as_value(store.code_stats()?),
+
         other => Err(IcmError::InvalidInput(format!(
             "unknown store-RPC method: {other}"
         ))),
@@ -463,6 +507,52 @@ mod tests {
             json!({"session_id": "s1"}),
         );
         assert_eq!(msgs.result.unwrap().as_array().unwrap().len(), 1);
+    }
+
+    #[cfg(feature = "code-graph")]
+    #[test]
+    fn code_dispatch_index_and_explore() {
+        use icm_core::{CodeFile, CodeLanguage, Ref, RefKind, Symbol, SymbolKind};
+        let store = Store::in_memory().unwrap();
+        let a = Symbol {
+            id: "f#a@1".into(),
+            file: "f.rs".into(),
+            name: "a".into(),
+            kind: SymbolKind::Function,
+            language: CodeLanguage::Rust,
+            start_line: 1,
+            end_line: 1,
+            parent: None,
+        };
+        let b = Symbol { id: "f#b@2".into(), name: "b".into(), start_line: 2, end_line: 2, ..a.clone() };
+        let call = Ref {
+            from_symbol: a.id.clone(),
+            target_name: "b".into(),
+            target_symbol: Some(b.id.clone()),
+            kind: RefKind::Call,
+            line: 1,
+        };
+        let file = CodeFile {
+            path: "f.rs".into(),
+            language: CodeLanguage::Rust,
+            content_hash: "h".into(),
+            stale: false,
+        };
+        let idx = dispatch(
+            &store,
+            None,
+            "code.index_file",
+            json!({ "file": file, "symbols": [a, b], "refs": [call] }),
+        );
+        assert!(idx.error.is_none(), "index_file: {:?}", idx.error);
+
+        let exp = dispatch(&store, None, "code.explore", json!({ "name": "b" }));
+        let v = exp.result.unwrap();
+        assert_eq!(v["symbol"]["name"], json!("b"));
+        assert_eq!(v["callers"].as_array().unwrap().len(), 1);
+
+        let stats = dispatch(&store, None, "code.code_stats", json!({}));
+        assert_eq!(stats.result.unwrap()["symbols"], json!(2));
     }
 
     #[test]
