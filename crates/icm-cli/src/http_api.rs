@@ -176,18 +176,7 @@ pub async fn run_http_server(
         token,
     };
 
-    let app = Router::new()
-        .route("/recall", post(handle_recall))
-        .route("/store", post(handle_store))
-        .route("/consolidate", post(handle_consolidate))
-        .route("/stats", get(handle_stats))
-        .route("/topics", get(handle_topics))
-        .route("/health", get(handle_health))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ))
-        .with_state(state);
+    let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -197,6 +186,55 @@ pub async fn run_http_server(
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Build the fully-layered router (routes + auth middleware + state).
+/// Extracted so tests can exercise handlers via `oneshot` without
+/// binding a socket.
+#[cfg_attr(not(feature = "remote-store"), allow(unused_mut))]
+fn build_router(state: AppState) -> Router {
+    let mut router = Router::new()
+        .route("/recall", post(handle_recall))
+        .route("/store", post(handle_store))
+        .route("/consolidate", post(handle_consolidate))
+        .route("/stats", get(handle_stats))
+        .route("/topics", get(handle_topics))
+        .route("/health", get(handle_health));
+    // The full store-RPC surface (F-001) — only when the remote-store
+    // feature is compiled in. Sits behind the same Bearer middleware.
+    #[cfg(feature = "remote-store")]
+    {
+        router = router.route("/rpc", post(handle_rpc));
+    }
+    router
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
+        .with_state(state)
+}
+
+/// Handler for `POST /rpc`: the full store-trait surface over JSON-RPC
+/// (F-001). Deserializes an [`icm_core::RpcRequest`], dispatches to the
+/// warm local `Store` (embedding server-side), and returns an
+/// [`icm_core::RpcResponse`]. Auth is enforced by the shared middleware.
+#[cfg(feature = "remote-store")]
+async fn handle_rpc(
+    State(state): State<AppState>,
+    Json(req): Json<icm_core::RpcRequest>,
+) -> Response {
+    let store = match state.store.lock() {
+        Ok(s) => s,
+        Err(_) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "store poisoned",
+                OutputFormat::Json,
+            )
+        }
+    };
+    let resp = crate::rpc_dispatch::dispatch(&store, state.embedder_ref(), &req.method, req.params);
+    Json(resp).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -647,6 +685,79 @@ fn err_response(status: StatusCode, msg: &str, format: OutputFormat) -> Response
             format!("error: {msg}\n"),
         )
             .into_response(),
+    }
+}
+
+#[cfg(all(test, feature = "remote-store"))]
+mod rpc_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt; // for `oneshot`
+
+    fn test_state(token: Option<&str>) -> AppState {
+        AppState {
+            store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
+            embedder: None,
+            token: token.map(str::to_string),
+        }
+    }
+
+    fn rpc_request(token: Option<&str>, body: &str) -> Request<Body> {
+        let mut b = Request::post("/rpc").header("content-type", "application/json");
+        if let Some(t) = token {
+            b = b.header("authorization", format!("Bearer {t}"));
+        }
+        b.body(Body::from(body.to_string())).unwrap()
+    }
+
+    async fn body_json(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rpc_endpoint_roundtrips_store_and_recall() {
+        let app = build_router(test_state(Some("secret")));
+
+        // Missing token → 401.
+        let unauth = app
+            .clone()
+            .oneshot(rpc_request(None, r#"{"method":"memory.count","params":{}}"#))
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        // Store a memory.
+        let m = Memory::new("t".to_string(), "hello world".to_string(), Importance::Medium);
+        let store_body =
+            serde_json::json!({"method":"memory.store","params":{"memory": m}}).to_string();
+        let stored = app
+            .clone()
+            .oneshot(rpc_request(Some("secret"), &store_body))
+            .await
+            .unwrap();
+        assert_eq!(stored.status(), StatusCode::OK);
+
+        // Count → 1.
+        let counted = app
+            .clone()
+            .oneshot(rpc_request(Some("secret"), r#"{"method":"memory.count","params":{}}"#))
+            .await
+            .unwrap();
+        let v = body_json(counted).await;
+        assert_eq!(v["result"], serde_json::json!(1));
+
+        // Unknown method → error field, still HTTP 200.
+        let bogus = app
+            .clone()
+            .oneshot(rpc_request(Some("secret"), r#"{"method":"nope.x","params":{}}"#))
+            .await
+            .unwrap();
+        let bv = body_json(bogus).await;
+        assert!(bv.get("error").is_some());
     }
 }
 
