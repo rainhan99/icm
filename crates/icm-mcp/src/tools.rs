@@ -705,6 +705,20 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
         }));
     }
 
+    #[cfg(feature = "code-graph")]
+    tools.push(json!({
+        "name": "icm_code_explore",
+        "description": "Explore a code symbol from ICM's pre-built code graph: its definition location, who calls it (callers), what it calls (callees), and its change blast-radius — all in ONE call. Use this for structural questions ('who calls X', 'what does X call', 'what breaks if I change X') instead of grep/read crawling. Requires `icm code index` to have run.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "symbol": { "type": "string", "description": "Symbol name to explore (function/type/method)" },
+                "max_depth": { "type": "integer", "description": "Blast-radius traversal depth (default 3)" }
+            },
+            "required": ["symbol"]
+        }
+    }));
+
     json!({ "tools": tools })
 }
 
@@ -757,7 +771,60 @@ pub fn call_tool(
         "icm_transcript_stats" => tool_transcript_stats(store),
         // Wake-up tool
         "icm_wake_up" => tool_wake_up(store, args),
+        // Code-graph tool (F-002)
+        #[cfg(feature = "code-graph")]
+        "icm_code_explore" => tool_code_explore(store, args),
         _ => ToolResult::error(format!("unknown tool: {name}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Code-graph tool handler (F-002)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "code-graph")]
+fn tool_code_explore(store: &Store, args: &Value) -> ToolResult {
+    use icm_core::CodeGraphStore;
+    let Some(symbol) = args.get("symbol").and_then(|v| v.as_str()) else {
+        return ToolResult::error("missing required arg: symbol".to_string());
+    };
+    let depth = args
+        .get("max_depth")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3) as usize;
+    let names = |syms: &[icm_core::Symbol]| -> String {
+        if syms.is_empty() {
+            "(none)".to_string()
+        } else {
+            syms.iter()
+                .map(|s| format!("{} ({}:{})", s.name, s.file, s.start_line))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    match store.explore(symbol, depth) {
+        Ok(Some(res)) => {
+            let mut out = format!(
+                "{:?} {} @ {}:{}-{}\n",
+                res.symbol.kind,
+                res.symbol.name,
+                res.symbol.file,
+                res.symbol.start_line,
+                res.symbol.end_line
+            );
+            out.push_str(&format!("callers ({}): {}\n", res.callers.len(), names(&res.callers)));
+            out.push_str(&format!("callees ({}): {}\n", res.callees.len(), names(&res.callees)));
+            out.push_str(&format!(
+                "blast radius ({}): {}\n",
+                res.blast_radius.len(),
+                names(&res.blast_radius)
+            ));
+            ToolResult::text(out)
+        }
+        Ok(None) => ToolResult::text(format!(
+            "no symbol named {symbol:?} in the code graph — run `icm code index` first"
+        )),
+        Err(e) => ToolResult::error(format!("code explore failed: {e}")),
     }
 }
 
@@ -2351,6 +2418,49 @@ mod tests {
 
     fn test_store() -> Store {
         Store::in_memory().unwrap()
+    }
+
+    #[cfg(feature = "code-graph")]
+    #[test]
+    fn test_code_explore_tool() {
+        use icm_core::{CodeFile, CodeGraphStore, CodeLanguage, Ref, RefKind, Symbol, SymbolKind};
+        let store = test_store();
+        let mk = |id: &str, name: &str, line: u32| Symbol {
+            id: id.into(),
+            file: "f.rs".into(),
+            name: name.into(),
+            kind: SymbolKind::Function,
+            language: CodeLanguage::Rust,
+            start_line: line,
+            end_line: line,
+            parent: None,
+        };
+        let a = mk("f#a@1", "a", 1);
+        let b = mk("f#b@2", "b", 2);
+        let call = Ref {
+            from_symbol: a.id.clone(),
+            target_name: "b".into(),
+            target_symbol: Some(b.id.clone()),
+            kind: RefKind::Call,
+            line: 1,
+        };
+        let file = CodeFile {
+            path: "f.rs".into(),
+            language: CodeLanguage::Rust,
+            content_hash: "h".into(),
+            stale: false,
+        };
+        store.index_file(&file, &[a, b], &[call]).unwrap();
+
+        let result = call_tool(&store, None, "icm_code_explore", &json!({"symbol": "b"}), false);
+        assert!(!result.is_error, "explore ok");
+        let text = &result.content[0].text;
+        assert!(text.contains("b @ f.rs"), "def line: {text}");
+        assert!(text.contains("callers (1)"), "b has caller a: {text}");
+
+        // Missing symbol → friendly message, not an error.
+        let miss = call_tool(&store, None, "icm_code_explore", &json!({"symbol": "zzz"}), false);
+        assert!(miss.content[0].text.contains("no symbol"));
     }
 
     #[test]
