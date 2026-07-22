@@ -1460,11 +1460,19 @@ fn embed_cache_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".icm-cache/embeddings"))
 }
 
+/// A built embedder plus, when the caching (cloud) path is active, a
+/// shared handle to its cache metrics for the `/cache` observability
+/// endpoints (F-001).
+type BuiltEmbedder = (
+    Option<Box<dyn icm_core::Embedder + Send + Sync>>,
+    Option<std::sync::Arc<icm_core::CacheMetrics>>,
+);
+
 /// Build the active embedder from config, boxed as a trait object so the
 /// local (fastembed) and cloud (OpenAI + cache) providers share one type.
-/// Returns `None` when the selected provider's build feature is absent —
-/// the caller then falls back to keyword/FTS search.
-fn build_embedder(cfg: &config::Config) -> Option<Box<dyn icm_core::Embedder + Send + Sync>> {
+/// The embedder is `None` when the selected provider's build feature is
+/// absent — the caller then falls back to keyword/FTS search.
+fn build_embedder(cfg: &config::Config) -> BuiltEmbedder {
     match resolve_embedder_kind(
         &cfg.embeddings.provider,
         &cfg.embeddings.base_url,
@@ -1481,21 +1489,20 @@ fn build_embedder(cfg: &config::Config) -> Option<Box<dyn icm_core::Embedder + S
 }
 
 #[cfg(feature = "embeddings")]
-fn build_local_embedder(model: &str) -> Option<Box<dyn icm_core::Embedder + Send + Sync>> {
-    Some(Box::new(icm_core::FastEmbedder::with_model(model)))
+fn build_local_embedder(model: &str) -> BuiltEmbedder {
+    (
+        Some(Box::new(icm_core::FastEmbedder::with_model(model))),
+        None,
+    )
 }
 
 #[cfg(not(feature = "embeddings"))]
-fn build_local_embedder(_model: &str) -> Option<Box<dyn icm_core::Embedder + Send + Sync>> {
-    None
+fn build_local_embedder(_model: &str) -> BuiltEmbedder {
+    (None, None)
 }
 
 #[cfg(feature = "cloud-embeddings")]
-fn build_openai_embedder(
-    base_url: &str,
-    model: &str,
-    dims: usize,
-) -> Option<Box<dyn icm_core::Embedder + Send + Sync>> {
+fn build_openai_embedder(base_url: &str, model: &str, dims: usize) -> BuiltEmbedder {
     // Key comes from the environment only, never config-on-disk, and is
     // never logged. `ICM_EMBED_API_KEY` wins so a cloud embed key can
     // differ from any `OPENAI_API_KEY` used elsewhere.
@@ -1506,26 +1513,19 @@ fn build_openai_embedder(
     let base = icm_core::OpenAiEmbedder::new(base_url, &key, model, dims);
     // Wrap in the caching decorator so repeated embeds skip the paid API
     // and populate the `/cache` metrics.
-    Some(Box::new(icm_core::CachingEmbedder::with_dir(
-        Box::new(base),
-        model,
-        4096,
-        &embed_cache_dir(),
-    )))
+    let caching = icm_core::CachingEmbedder::with_dir(Box::new(base), model, 4096, &embed_cache_dir());
+    let metrics = caching.metrics();
+    (Some(Box::new(caching)), Some(metrics))
 }
 
 #[cfg(not(feature = "cloud-embeddings"))]
-fn build_openai_embedder(
-    base_url: &str,
-    model: &str,
-    dims: usize,
-) -> Option<Box<dyn icm_core::Embedder + Send + Sync>> {
+fn build_openai_embedder(base_url: &str, model: &str, dims: usize) -> BuiltEmbedder {
     let _ = (base_url, model, dims);
     tracing::warn!(
         "[embeddings] provider=openai requires the `cloud-embeddings` build feature; \
          embeddings disabled for this run"
     );
-    None
+    (None, None)
 }
 
 #[cfg(test)]
@@ -1596,10 +1596,10 @@ fn main() -> Result<()> {
         active_backend,
     ) && std::env::var("ICM_NO_EMBEDDINGS").is_err();
     #[allow(unused_variables)]
-    let embedder: Option<Box<dyn icm_core::Embedder + Send + Sync>> = if embeddings_enabled {
+    let (embedder, cache_metrics): BuiltEmbedder = if embeddings_enabled {
         build_embedder(&cfg)
     } else {
-        None
+        (None, None)
     };
     let embedding_dims = resolve_embedding_dims(
         embedder.as_deref().map(|e| e as &dyn icm_core::Embedder),
@@ -2079,8 +2079,9 @@ fn main() -> Result<()> {
             #[cfg(feature = "http-api")]
             if let Some(addr) = http {
                 // `embedder` is already a boxed trait object (F-001); the
-                // HTTP server takes ownership of the warm embedder.
-                return http_api::run_http_server(store, embedder, addr, token);
+                // HTTP server takes ownership of the warm embedder and the
+                // cache metrics handle (for /cache).
+                return http_api::run_http_server(store, embedder, cache_metrics, addr, token);
             }
             #[cfg(feature = "embeddings")]
             let emb_ref = embedder.as_deref().map(|e| e as &dyn icm_core::Embedder);

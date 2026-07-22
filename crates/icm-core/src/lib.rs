@@ -1,4 +1,5 @@
 pub mod auto_link;
+pub mod cache;
 #[cfg(feature = "cloud-embeddings")]
 pub mod caching_embedder;
 pub mod context_snapshot;
@@ -36,8 +37,9 @@ pub use facts::{Fact, FactsStats};
 pub use facts_store::FactsStore;
 #[cfg(feature = "embeddings")]
 pub use fastembed_embedder::FastEmbedder;
+pub use cache::CacheMetrics;
 #[cfg(feature = "cloud-embeddings")]
-pub use caching_embedder::{CacheMetrics, CachingEmbedder};
+pub use caching_embedder::CachingEmbedder;
 #[cfg(feature = "cloud-embeddings")]
 pub use openai_embedder::OpenAiEmbedder;
 pub use feedback::{Feedback, FeedbackStats};

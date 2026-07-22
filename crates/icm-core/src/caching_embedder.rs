@@ -16,54 +16,14 @@
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use lru::LruCache;
 use sha2::{Digest, Sha256};
 
+use crate::cache::CacheMetrics;
 use crate::embedder::Embedder;
 use crate::error::IcmResult;
-
-/// Atomic counters describing cache behaviour. Cheap to read (no lock),
-/// safe to share across threads via `Arc`. Serialized by the HTTP layer
-/// for `/cache/stats`.
-#[derive(Debug, Default)]
-pub struct CacheMetrics {
-    hits: AtomicU64,
-    misses: AtomicU64,
-    disk_hits: AtomicU64,
-    entries: AtomicU64,
-    disk_bytes: AtomicU64,
-}
-
-impl CacheMetrics {
-    /// In-memory (hot) hits.
-    pub fn hits(&self) -> u64 {
-        self.hits.load(Ordering::Relaxed)
-    }
-    /// Misses that fell through to the underlying embedder.
-    pub fn misses(&self) -> u64 {
-        self.misses.load(Ordering::Relaxed)
-    }
-    /// Hits served from the disk layer (0 until the disk layer lands).
-    pub fn disk_hits(&self) -> u64 {
-        self.disk_hits.load(Ordering::Relaxed)
-    }
-    /// Distinct entries currently held in the in-memory cache.
-    pub fn entries(&self) -> u64 {
-        self.entries.load(Ordering::Relaxed)
-    }
-    /// Bytes written to the disk layer.
-    pub fn disk_bytes(&self) -> u64 {
-        self.disk_bytes.load(Ordering::Relaxed)
-    }
-    /// Underlying-embedder calls avoided = hot hits + disk hits. This is
-    /// the headline "API calls saved" number for cloud embedders.
-    pub fn calls_saved(&self) -> u64 {
-        self.hits() + self.disk_hits()
-    }
-}
 
 /// An [`Embedder`] wrapper adding a `(role, model, text)`-keyed cache.
 pub struct CachingEmbedder {
@@ -153,7 +113,7 @@ impl CachingEmbedder {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        self.metrics.disk_hits.fetch_add(1, Ordering::Relaxed);
+        self.metrics.record_disk_hit();
         Some(vec)
     }
 
@@ -173,9 +133,7 @@ impl CachingEmbedder {
             bytes.extend_from_slice(&f.to_le_bytes());
         }
         if std::fs::write(&path, &bytes).is_ok() {
-            self.metrics
-                .disk_bytes
-                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            self.metrics.add_disk_bytes(bytes.len() as u64);
         }
     }
 
@@ -189,7 +147,7 @@ impl CachingEmbedder {
         let mut c = self.mem.lock().ok()?;
         let v = c.get(key).cloned();
         if v.is_some() {
-            self.metrics.hits.fetch_add(1, Ordering::Relaxed);
+            self.metrics.record_hit();
         }
         v
     }
@@ -198,9 +156,7 @@ impl CachingEmbedder {
     fn mem_put(&self, key: String, vec: Vec<f32>) {
         if let Ok(mut c) = self.mem.lock() {
             c.put(key, vec);
-            self.metrics
-                .entries
-                .store(c.len() as u64, Ordering::Relaxed);
+            self.metrics.set_entries(c.len() as u64);
         }
     }
 
@@ -215,7 +171,7 @@ impl CachingEmbedder {
             self.mem_put(key, v.clone());
             return Ok(v);
         }
-        self.metrics.misses.fetch_add(1, Ordering::Relaxed);
+        self.metrics.record_miss();
         let vec = if role == QRY {
             self.inner.embed_query(text)?
         } else {
@@ -256,9 +212,9 @@ impl Embedder for CachingEmbedder {
             }
         }
         if !miss_txt.is_empty() {
-            self.metrics
-                .misses
-                .fetch_add(miss_txt.len() as u64, Ordering::Relaxed);
+            for _ in 0..miss_txt.len() {
+                self.metrics.record_miss();
+            }
             let fresh = self.inner.embed_batch(&miss_txt)?;
             for (slot, vec) in miss_idx.into_iter().zip(fresh) {
                 let key = cache_key(DOC, &self.model, texts[slot]);
@@ -278,7 +234,7 @@ impl Embedder for CachingEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A stub embedder counting how many times the inner layer is hit.
     #[derive(Clone)]

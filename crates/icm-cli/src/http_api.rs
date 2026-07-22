@@ -61,6 +61,9 @@ pub struct AppState {
     embedder: Option<Arc<dyn Embedder + Send + Sync>>,
     /// When set, every request must carry `Authorization: Bearer <token>`.
     token: Option<String>,
+    /// Embedding-cache metrics for `/cache` (F-001). `None` when the
+    /// active embedder has no cache (local provider / no embedder).
+    cache_metrics: Option<Arc<icm_core::CacheMetrics>>,
 }
 
 impl AppState {
@@ -167,6 +170,7 @@ pub struct ConsolidateReq {
 pub async fn run_http_server(
     store: Store,
     embedder: Option<Box<dyn Embedder + Send + Sync>>,
+    cache_metrics: Option<Arc<icm_core::CacheMetrics>>,
     addr: SocketAddr,
     token: Option<String>,
 ) -> Result<()> {
@@ -174,6 +178,7 @@ pub async fn run_http_server(
         store: Arc::new(Mutex::new(store)),
         embedder: embedder.map(Arc::from),
         token,
+        cache_metrics,
     };
 
     let app = build_router(state);
@@ -199,7 +204,8 @@ fn build_router(state: AppState) -> Router {
         .route("/consolidate", post(handle_consolidate))
         .route("/stats", get(handle_stats))
         .route("/topics", get(handle_topics))
-        .route("/health", get(handle_health));
+        .route("/health", get(handle_health))
+        .route("/cache/stats", get(handle_cache_stats));
     // The full store-RPC surface (F-001) — only when the remote-store
     // feature is compiled in. Sits behind the same Bearer middleware.
     #[cfg(feature = "remote-store")]
@@ -627,6 +633,33 @@ async fn handle_topics(
 }
 
 // ---------------------------------------------------------------------------
+// Handler: /cache/stats — embedding cache usage (F-001)
+// ---------------------------------------------------------------------------
+
+/// Snapshot of embedding-cache metrics as JSON. When no cache is active
+/// (local provider / no embedder), reports `enabled: false` with zeros so
+/// the dashboard renders consistently.
+async fn handle_cache_stats(State(state): State<AppState>) -> Response {
+    let payload = match &state.cache_metrics {
+        Some(m) => json!({
+            "enabled": true,
+            "hits": m.hits(),
+            "misses": m.misses(),
+            "disk_hits": m.disk_hits(),
+            "entries": m.entries(),
+            "disk_bytes": m.disk_bytes(),
+            "calls_saved": m.calls_saved(),
+        }),
+        None => json!({
+            "enabled": false,
+            "hits": 0, "misses": 0, "disk_hits": 0,
+            "entries": 0, "disk_bytes": 0, "calls_saved": 0,
+        }),
+    };
+    Json(payload).into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Handler: /health (unauthenticated, used by integration tests + probes)
 // ---------------------------------------------------------------------------
 
@@ -700,6 +733,7 @@ mod rpc_tests {
             store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
             embedder: None,
             token: token.map(str::to_string),
+            cache_metrics: None,
         }
     }
 
@@ -839,5 +873,59 @@ mod tests {
 
         assert!(parse_keywords_value(None).is_empty());
         assert!(parse_keywords_value(Some(&json!(42))).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt; // for `oneshot`
+
+    #[tokio::test]
+    async fn cache_stats_endpoint_reports_metrics() {
+        let metrics = Arc::new(icm_core::CacheMetrics::default());
+        metrics.record_hit();
+        metrics.record_miss();
+        metrics.record_hit();
+        let state = AppState {
+            store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
+            embedder: None,
+            token: None,
+            cache_metrics: Some(Arc::clone(&metrics)),
+        };
+        let resp = build_router(state)
+            .oneshot(Request::get("/cache/stats").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["enabled"], serde_json::json!(true));
+        assert_eq!(v["hits"], serde_json::json!(2));
+        assert_eq!(v["misses"], serde_json::json!(1));
+        assert_eq!(v["calls_saved"], serde_json::json!(2));
+    }
+
+    #[tokio::test]
+    async fn cache_stats_disabled_when_no_metrics() {
+        let state = AppState {
+            store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
+            embedder: None,
+            token: None,
+            cache_metrics: None,
+        };
+        let resp = build_router(state)
+            .oneshot(Request::get("/cache/stats").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["enabled"], serde_json::json!(false));
     }
 }
