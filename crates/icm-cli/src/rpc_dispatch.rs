@@ -21,7 +21,7 @@ use serde_json::Value;
 
 use icm_core::{
     Concept, ConceptLink, Embedder, FactsStore, Feedback, FeedbackStore, IcmError, IcmResult,
-    Label, Memoir, MemoirStore, Memory, MemoryStore, Relation, RpcResponse,
+    Label, Memoir, MemoirStore, Memory, MemoryStore, Relation, Role, RpcResponse, TranscriptStore,
 };
 use icm_store::Store;
 
@@ -315,6 +315,51 @@ fn dispatch_inner(
             as_value(store.batch_memoir_concept_counts()?)
         }
 
+        // --- TranscriptStore ---
+        "transcript.create_session" => as_value(store.create_session(
+            &want_str(p, "agent")?,
+            opt_str(p, "project").as_deref(),
+            opt_str(p, "metadata").as_deref(),
+        )?),
+        "transcript.ensure_session" => as_value(store.ensure_session(
+            &want_str(p, "id")?,
+            &want_str(p, "agent")?,
+            opt_str(p, "project").as_deref(),
+            opt_str(p, "metadata").as_deref(),
+        )?),
+        "transcript.get_session" => as_value(store.get_session(&want_str(p, "id")?)?),
+        "transcript.list_sessions" => as_value(
+            store.list_sessions(opt_str(p, "project").as_deref(), opt_usize(p, "limit", 50))?,
+        ),
+        "transcript.record_message" => {
+            let role: Role = want_val(p, "role")?;
+            let tokens: Option<i64> = p.get("tokens").and_then(Value::as_i64);
+            as_value(store.record_message(
+                &want_str(p, "session_id")?,
+                role,
+                &want_str(p, "content")?,
+                opt_str(p, "tool_name").as_deref(),
+                tokens,
+                opt_str(p, "metadata").as_deref(),
+            )?)
+        }
+        "transcript.list_session_messages" => as_value(store.list_session_messages(
+            &want_str(p, "session_id")?,
+            opt_usize(p, "limit", 100),
+            opt_usize(p, "offset", 0),
+        )?),
+        "transcript.search_transcripts" => as_value(store.search_transcripts(
+            &want_str(p, "query")?,
+            opt_str(p, "session_id").as_deref(),
+            opt_str(p, "project").as_deref(),
+            opt_usize(p, "limit", 10),
+        )?),
+        "transcript.forget_session" => {
+            store.forget_session(&want_str(p, "id")?)?;
+            Ok(Value::Null)
+        }
+        "transcript.transcript_stats" => as_value(store.transcript_stats()?),
+
         other => Err(IcmError::InvalidInput(format!(
             "unknown store-RPC method: {other}"
         ))),
@@ -390,6 +435,34 @@ mod tests {
         );
         let arr = listed.result.unwrap();
         assert_eq!(arr.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn transcript_roundtrip() {
+        let store = Store::in_memory().unwrap();
+        let sid = dispatch(
+            &store,
+            None,
+            "transcript.ensure_session",
+            json!({"id": "s1", "agent": "claude", "project": "icm"}),
+        );
+        assert!(sid.error.is_none(), "ensure_session: {:?}", sid.error);
+
+        let rec = dispatch(
+            &store,
+            None,
+            "transcript.record_message",
+            json!({"session_id": "s1", "role": Role::User, "content": "hello"}),
+        );
+        assert!(rec.error.is_none(), "record_message: {:?}", rec.error);
+
+        let msgs = dispatch(
+            &store,
+            None,
+            "transcript.list_session_messages",
+            json!({"session_id": "s1"}),
+        );
+        assert_eq!(msgs.result.unwrap().as_array().unwrap().len(), 1);
     }
 
     #[test]
