@@ -4027,6 +4027,38 @@ mod tests {
         assert!(s.get(&idb).unwrap().is_some());
     }
 
+    #[test]
+    fn supersede_similar_marks_old() {
+        use icm_core::{supersede_similar, Importance, Memory, MemoryStore};
+        let s = SqliteStore::in_memory_with_dims(384).unwrap();
+        // Existing active memory with a known embedding.
+        let mut old = Memory::new("profile".to_string(), "dark mode preferred".to_string(), Importance::Medium);
+        old.embedding = Some(vec![1.0_f32; 384]);
+        let old_id = s.store(old).unwrap();
+
+        // A near-duplicate (same topic + same embedding) about to be stored.
+        let mut new = Memory::new("profile".to_string(), "dark mode preferred setting".to_string(), Importance::Medium);
+        new.embedding = Some(vec![1.0_f32; 384]);
+
+        // Threshold 0.5: identical embedding → supersedes the old one.
+        let superseded = supersede_similar(&s, &new.topic, &new.embed_text(), new.embedding.as_ref().unwrap(), 0.5).unwrap();
+        assert_eq!(superseded.as_deref(), Some(old_id.as_str()));
+        assert!(!s.get(&old_id).unwrap().unwrap().is_active(), "old marked superseded");
+    }
+
+    #[test]
+    fn supersede_disabled_at_threshold_one() {
+        use icm_core::{supersede_similar, Importance, Memory, MemoryStore};
+        let s = SqliteStore::in_memory_with_dims(384).unwrap();
+        let mut old = Memory::new("profile".to_string(), "x".to_string(), Importance::Medium);
+        old.embedding = Some(vec![1.0_f32; 384]);
+        let old_id = s.store(old).unwrap();
+        // threshold >= 1.0 disables supersession entirely (today's behavior).
+        let r = supersede_similar(&s, "profile", "x", &vec![1.0_f32; 384], 1.0).unwrap();
+        assert!(r.is_none());
+        assert!(s.get(&old_id).unwrap().unwrap().is_active(), "old still active");
+    }
+
     // === Embedding dimension guard (F-001) ===
 
     #[test]

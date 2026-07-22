@@ -61,7 +61,9 @@ pub use memory::{
 #[cfg(feature = "cloud-embeddings")]
 pub use openai_embedder::OpenAiEmbedder;
 pub use remote_protocol::{is_known_method, RpcRequest, RpcResponse, ALL_METHODS};
-pub use store::{find_similar_memory, MemoryStore, DEDUP_SIMILARITY_THRESHOLD};
+pub use store::{
+    find_similar_memory, supersede_similar, MemoryStore, DEDUP_SIMILARITY_THRESHOLD,
+};
 pub use transcript::{Message, Role, Session, TranscriptHit, TranscriptStats};
 pub use transcript_store::TranscriptStore;
 pub use wake_up::{

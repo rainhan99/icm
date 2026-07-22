@@ -21,6 +21,43 @@ pub fn find_similar_memory(
         .find(|(m, score)| *score > threshold && m.topic == topic))
 }
 
+/// Heuristic near-duplicate temporal supersession (F-003).
+///
+/// Before storing a new memory, call this to mark an existing **active**,
+/// same-topic near-duplicate (hybrid similarity > `threshold`) as
+/// superseded (sets `superseded_at` via `update`). Returns the superseded
+/// id, or `None` if nothing qualifies.
+///
+/// Scope/limitation (authorized): this catches near-DUPLICATES (high
+/// surface + vector similarity), NOT semantic contradictions with low
+/// surface similarity (e.g. "lives in NYC" → "moved to SF"). True
+/// contradiction detection needs an LLM and is out of phase-1 scope.
+///
+/// `threshold >= 1.0` (or an empty embedding) disables supersession and
+/// returns `None` — the store then behaves exactly as before.
+pub fn supersede_similar(
+    store: &dyn MemoryStore,
+    topic: &str,
+    embed_text: &str,
+    embedding: &[f32],
+    threshold: f32,
+) -> IcmResult<Option<String>> {
+    if threshold >= 1.0 || embedding.is_empty() {
+        return Ok(None);
+    }
+    // `find_similar_memory` searches hybrid (which already excludes
+    // superseded rows), so we only ever supersede an active match.
+    match find_similar_memory(store, embed_text, embedding, topic, threshold)? {
+        Some((mut existing, _score)) => {
+            existing.superseded_at = Some(chrono::Utc::now());
+            let id = existing.id.clone();
+            store.update(&existing)?;
+            Ok(Some(id))
+        }
+        None => Ok(None),
+    }
+}
+
 pub trait MemoryStore {
     // CRUD
     fn store(&self, memory: Memory) -> IcmResult<String>;
