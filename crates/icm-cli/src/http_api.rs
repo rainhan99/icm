@@ -205,7 +205,8 @@ fn build_router(state: AppState) -> Router {
         .route("/stats", get(handle_stats))
         .route("/topics", get(handle_topics))
         .route("/health", get(handle_health))
-        .route("/cache/stats", get(handle_cache_stats));
+        .route("/cache/stats", get(handle_cache_stats))
+        .route("/cache", get(handle_cache_page));
     // The full store-RPC surface (F-001) — only when the remote-store
     // feature is compiled in. Sits behind the same Bearer middleware.
     #[cfg(feature = "remote-store")]
@@ -659,6 +660,63 @@ async fn handle_cache_stats(State(state): State<AppState>) -> Response {
     Json(payload).into_response()
 }
 
+/// Self-contained HTML dashboard for embedding-cache usage (F-001).
+/// Values are server-rendered at request time (no external assets, no
+/// fetch — so it works under Bearer auth without the browser needing to
+/// send the token on an XHR) and the page auto-refreshes every 5s.
+async fn handle_cache_page(State(state): State<AppState>) -> Response {
+    let (enabled, hits, misses, disk_hits, entries, disk_bytes, saved) = match &state.cache_metrics
+    {
+        Some(m) => (
+            true,
+            m.hits(),
+            m.misses(),
+            m.disk_hits(),
+            m.entries(),
+            m.disk_bytes(),
+            m.calls_saved(),
+        ),
+        None => (false, 0, 0, 0, 0, 0, 0),
+    };
+    let lookups = hits + disk_hits + misses;
+    let hit_rate = if lookups > 0 {
+        (hits + disk_hits) as f64 * 100.0 / lookups as f64
+    } else {
+        0.0
+    };
+    let status = if enabled {
+        "active"
+    } else {
+        "no cache (local provider or embeddings disabled)"
+    };
+    let html = format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<meta http-equiv=\"refresh\" content=\"5\"><title>ICM embedding cache</title>\
+<style>body{{font-family:system-ui,sans-serif;margin:2rem;background:#0f1115;color:#e6e6e6}}\
+h1{{font-size:1.25rem}}.status{{color:#9aa4b2;margin-bottom:1rem}}\
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;max-width:760px}}\
+.card{{background:#1a1d24;border:1px solid #2a2f3a;border-radius:10px;padding:14px}}\
+.card .k{{font-size:.75rem;color:#9aa4b2;text-transform:uppercase;letter-spacing:.05em}}\
+.card .v{{font-size:1.5rem;font-weight:600;margin-top:4px}}</style></head><body>\
+<h1>ICM embedding cache</h1><div class=\"status\">status: {status}</div><div class=\"grid\">\
+<div class=\"card\"><div class=\"k\">hit rate</div><div class=\"v\">{hit_rate:.1}%</div></div>\
+<div class=\"card\"><div class=\"k\">hits</div><div class=\"v\">{hits}</div></div>\
+<div class=\"card\"><div class=\"k\">disk hits</div><div class=\"v\">{disk_hits}</div></div>\
+<div class=\"card\"><div class=\"k\">misses</div><div class=\"v\">{misses}</div></div>\
+<div class=\"card\"><div class=\"k\">entries</div><div class=\"v\">{entries}</div></div>\
+<div class=\"card\"><div class=\"k\">disk bytes</div><div class=\"v\">{disk_bytes}</div></div>\
+<div class=\"card\"><div class=\"k\">api calls saved</div><div class=\"v\">{saved}</div></div>\
+</div></body></html>"
+    );
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+        .into_response()
+}
+
 // ---------------------------------------------------------------------------
 // Handler: /health (unauthenticated, used by integration tests + probes)
 // ---------------------------------------------------------------------------
@@ -908,6 +966,38 @@ mod cache_tests {
         assert_eq!(v["hits"], serde_json::json!(2));
         assert_eq!(v["misses"], serde_json::json!(1));
         assert_eq!(v["calls_saved"], serde_json::json!(2));
+    }
+
+    #[tokio::test]
+    async fn cache_html_page() {
+        let metrics = Arc::new(icm_core::CacheMetrics::default());
+        metrics.record_hit();
+        let state = AppState {
+            store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
+            embedder: None,
+            token: None,
+            cache_metrics: Some(metrics),
+        };
+        let resp = build_router(state)
+            .oneshot(Request::get("/cache").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(ct.starts_with("text/html"), "content-type: {ct}");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("hits"));
+        assert!(body.contains("misses"));
+        assert!(body.contains("hit rate"));
     }
 
     #[tokio::test]
