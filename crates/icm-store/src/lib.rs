@@ -41,6 +41,9 @@ mod postgres;
 #[cfg(feature = "opensearch")]
 mod opensearch;
 
+#[cfg(feature = "remote-store")]
+mod remote;
+
 // Shared row types (backend-agnostic).
 pub use common::{CodeArea, HookEvent, HookEventInsert, HookStatsRow, PendingRow};
 
@@ -54,3 +57,6 @@ pub use opensearch::OpenSearchStore;
 pub use postgres::PostgresStore;
 #[cfg(feature = "backend-sqlite")]
 pub use store::SqliteStore;
+
+#[cfg(feature = "remote-store")]
+pub use remote::RemoteHttpStore;
