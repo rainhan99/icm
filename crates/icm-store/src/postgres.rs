@@ -208,6 +208,9 @@ fn row_to_memory(row: &postgres::Row) -> Memory {
         related_ids,
         embedding,
         scope: icm_core::Scope::User,
+        // F-003 supersession is a SQLite-phase feature; the Postgres
+        // backend does not persist superseded_at yet (F-003b territory).
+        superseded_at: None,
     }
 }
 

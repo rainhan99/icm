@@ -524,6 +524,9 @@ impl OpenSearchStore {
             related_ids: arr("related_ids"),
             embedding,
             scope: Scope::default(),
+            // F-003 supersession not persisted by the OpenSearch backend
+            // (SQLite-phase feature).
+            superseded_at: None,
         }
     }
 
