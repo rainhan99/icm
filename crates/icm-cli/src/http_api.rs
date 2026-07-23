@@ -245,6 +245,7 @@ fn build_router(state: AppState) -> Router {
 #[cfg(feature = "remote-store")]
 async fn handle_rpc(
     State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
     Json(req): Json<icm_core::RpcRequest>,
 ) -> Response {
     let store = match state.store.lock() {
@@ -257,6 +258,15 @@ async fn handle_rpc(
             )
         }
     };
+    // F-003b: scope this request to its tenant (RLS) on the SAME locked
+    // store guard as the dispatch below — never split the lock.
+    if let Err(e) = store.set_tenant(Some(&tenant.0)) {
+        return err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("tenant scope failed: {e}"),
+            OutputFormat::Json,
+        );
+    }
     let resp = crate::rpc_dispatch::dispatch(&store, state.embedder_ref(), &req.method, req.params);
     Json(resp).into_response()
 }
@@ -349,12 +359,13 @@ async fn handle_whoami(tenant: Option<Extension<Tenant>>) -> Response {
 
 async fn handle_recall(
     State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
     headers: HeaderMap,
     Query(q): Query<FormatQuery>,
     Json(req): Json<RecallReq>,
 ) -> Response {
     let format = OutputFormat::resolve(&q, &headers);
-    match run_recall(&state, &req) {
+    match run_recall(&state, &req, &tenant) {
         Ok(results) => render_recall(&results, format),
         Err(e) => err_response(StatusCode::BAD_REQUEST, &e.to_string(), format),
     }
@@ -365,7 +376,11 @@ async fn handle_recall(
 /// it with the project's `recall_format` renderer (TOON or JSON).
 /// Reuses the same store methods so behavior stays consistent across
 /// transports.
-fn run_recall(state: &AppState, req: &RecallReq) -> Result<Vec<(Memory, Option<f32>)>> {
+fn run_recall(
+    state: &AppState,
+    req: &RecallReq,
+    tenant: &Tenant,
+) -> Result<Vec<(Memory, Option<f32>)>> {
     if req.query.trim().is_empty() {
         anyhow::bail!("missing required field: query");
     }
@@ -373,6 +388,10 @@ fn run_recall(state: &AppState, req: &RecallReq) -> Result<Vec<(Memory, Option<f
         .store
         .lock()
         .map_err(|_| anyhow::anyhow!("store poisoned"))?;
+    // F-003b: scope to tenant (RLS) inside the SAME lock as the search.
+    store
+        .set_tenant(Some(&tenant.0))
+        .map_err(|e| anyhow::anyhow!("tenant scope failed: {e}"))?;
     if let Err(e) = store.maybe_auto_decay() {
         tracing::warn!(error = %e, "auto-decay failed during /recall");
     }
@@ -473,6 +492,7 @@ fn render_recall(results: &[(Memory, Option<f32>)], format: OutputFormat) -> Res
 
 async fn handle_store(
     State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
     headers: HeaderMap,
     Query(q): Query<FormatQuery>,
     Json(req): Json<StoreReq>,
@@ -503,7 +523,12 @@ async fn handle_store(
     }
 
     let outcome = match state.store.lock() {
-        Ok(store) => store.store(mem.clone()),
+        Ok(store) => {
+            if let Some(r) = scope_tenant(&store, &tenant, format) {
+                return r;
+            }
+            store.store(mem.clone())
+        }
         Err(_) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, "store poisoned", format),
     };
     match outcome {
@@ -556,6 +581,7 @@ fn parse_keywords_value(v: Option<&Value>) -> Vec<String> {
 
 async fn handle_consolidate(
     State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
     headers: HeaderMap,
     Query(q): Query<FormatQuery>,
     Json(req): Json<ConsolidateReq>,
@@ -568,6 +594,9 @@ async fn handle_consolidate(
         Ok(s) => s,
         Err(_) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, "store poisoned", format),
     };
+    if let Some(r) = scope_tenant(&store, &tenant, format) {
+        return r;
+    }
     let topic_memories = match store.get_by_topic(&req.topic) {
         Ok(ms) => ms,
         Err(e) => {
@@ -613,6 +642,7 @@ async fn handle_consolidate(
 
 async fn handle_stats(
     State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
     headers: HeaderMap,
     Query(q): Query<FormatQuery>,
 ) -> Response {
@@ -621,6 +651,9 @@ async fn handle_stats(
         Ok(s) => s,
         Err(_) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, "store poisoned", format),
     };
+    if let Some(r) = scope_tenant(&store, &tenant, format) {
+        return r;
+    }
     match store.stats() {
         Ok(s) => {
             let payload = json!({
@@ -665,6 +698,7 @@ async fn handle_stats(
 
 async fn handle_topics(
     State(state): State<AppState>,
+    Extension(tenant): Extension<Tenant>,
     headers: HeaderMap,
     Query(q): Query<FormatQuery>,
 ) -> Response {
@@ -673,6 +707,9 @@ async fn handle_topics(
         Ok(s) => s,
         Err(_) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, "store poisoned", format),
     };
+    if let Some(r) = scope_tenant(&store, &tenant, format) {
+        return r;
+    }
     match store.list_topics() {
         Ok(rows) => match format {
             OutputFormat::Json => json_value_response(json!(rows
@@ -846,6 +883,20 @@ fn err_response(status: StatusCode, msg: &str, format: OutputFormat) -> Response
     }
 }
 
+/// F-003b: scope the (already-locked) store to the request's tenant for RLS.
+/// Returns `Some(error_response)` to early-return on failure, `None` on
+/// success. MUST be called under the SAME lock guard as the query that
+/// follows so a concurrent request cannot change the tenant in between.
+fn scope_tenant(store: &Store, tenant: &Tenant, format: OutputFormat) -> Option<Response> {
+    store.set_tenant(Some(&tenant.0)).err().map(|e| {
+        err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("tenant scope failed: {e}"),
+            format,
+        )
+    })
+}
+
 #[cfg(all(test, feature = "remote-store"))]
 mod rpc_tests {
     use super::*;
@@ -869,6 +920,21 @@ mod rpc_tests {
             b = b.header("authorization", format!("Bearer {t}"));
         }
         b.body(Body::from(body.to_string())).unwrap()
+    }
+
+    /// State with a token→tenant map (F-003 multi-tenant mode).
+    fn test_state_multi(pairs: &[(&str, &str)]) -> AppState {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(t, tn)| (t.to_string(), tn.to_string()))
+            .collect();
+        AppState {
+            store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
+            embedder: None,
+            token: None,
+            tokens: Some(map),
+            cache_metrics: None,
+        }
     }
 
     async fn body_json(resp: Response) -> serde_json::Value {
@@ -931,6 +997,47 @@ mod rpc_tests {
             .unwrap();
         let bv = body_json(bogus).await;
         assert!(bv.get("error").is_some());
+    }
+
+    /// F-003b HTTP wiring: with a token→tenant map, each token is resolved to
+    /// its tenant and reaches the store handlers (set_tenant is called on the
+    /// locked store before dispatch). This runs on a SQLite store where
+    /// set_tenant is a safe no-op — so it proves the wiring + auth + that the
+    /// existing store path is unbroken. RLS *enforcement* (cross-tenant
+    /// invisibility) is proven at the store layer against Postgres
+    /// (icm-store: rls_isolation_across_tenants), since RLS is bypassed by the
+    /// superuser role a test container hands out.
+    #[tokio::test]
+    async fn rls_http_two_tenants_wiring() {
+        let app = build_router(test_state_multi(&[
+            ("tokA", "tenantA"),
+            ("tokB", "tenantB"),
+        ]));
+
+        // Both tenants store successfully over /rpc — the handler resolves
+        // the tenant, sets it on the locked store, and dispatches.
+        for tok in ["tokA", "tokB"] {
+            let m = Memory::new("t".to_string(), format!("{tok} data"), Importance::Medium);
+            let body =
+                serde_json::json!({"method":"memory.store","params":{"memory": m}}).to_string();
+            let r = app
+                .clone()
+                .oneshot(rpc_request(Some(tok), &body))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "{tok} store should succeed");
+        }
+
+        // Unknown token → 401 (never reaches a handler).
+        let bad = app
+            .clone()
+            .oneshot(rpc_request(
+                Some("nope"),
+                r#"{"method":"memory.count","params":{}}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
     }
 }
 
