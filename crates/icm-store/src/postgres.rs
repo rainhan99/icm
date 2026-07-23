@@ -2118,63 +2118,347 @@ impl FactsStore for PostgresStore {
     }
 }
 
+const SESSION_COLS: &str = "id, agent, project, started_at, updated_at, metadata";
+const MESSAGE_COLS: &str = "id, session_id, role, content, tool_name, tokens, ts, metadata";
+
+fn row_to_session(row: &postgres::Row) -> IcmResult<Session> {
+    Ok(Session {
+        id: row.try_get(0).map_err(pg_err)?,
+        agent: row.try_get(1).map_err(pg_err)?,
+        project: row.try_get(2).map_err(pg_err)?,
+        started_at: row.try_get(3).map_err(pg_err)?,
+        updated_at: row.try_get(4).map_err(pg_err)?,
+        metadata: row.try_get(5).map_err(pg_err)?,
+    })
+}
+
+fn row_to_message(row: &postgres::Row) -> IcmResult<Message> {
+    let role_str: String = row.try_get(2).map_err(pg_err)?;
+    Ok(Message {
+        id: row.try_get(0).map_err(pg_err)?,
+        session_id: row.try_get(1).map_err(pg_err)?,
+        role: Role::parse(&role_str).unwrap_or(Role::Tool),
+        content: row.try_get(3).map_err(pg_err)?,
+        tool_name: row.try_get(4).map_err(pg_err)?,
+        tokens: row.try_get(5).map_err(pg_err)?,
+        ts: row.try_get(6).map_err(pg_err)?,
+        metadata: row.try_get(7).map_err(pg_err)?,
+    })
+}
+
 impl TranscriptStore for PostgresStore {
     fn create_session(
         &self,
-        _agent: &str,
-        _project: Option<&str>,
-        _metadata: Option<&str>,
+        agent: &str,
+        project: Option<&str>,
+        metadata: Option<&str>,
     ) -> IcmResult<String> {
-        unsupported("transcript.create_session")
+        if self.readonly {
+            return Err(IcmError::ReadOnly("create_session".into()));
+        }
+        let session = Session::new(
+            agent.to_string(),
+            project.map(str::to_string),
+            metadata.map(str::to_string),
+        );
+        let mut c = self.conn()?;
+        c.execute(
+            "INSERT INTO sessions (id, agent, project, started_at, updated_at, metadata)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            &[
+                &session.id,
+                &session.agent,
+                &session.project,
+                &session.started_at,
+                &session.updated_at,
+                &session.metadata,
+            ],
+        )
+        .map_err(pg_err)?;
+        Ok(session.id)
     }
+
     fn ensure_session(
         &self,
-        _id: &str,
-        _agent: &str,
-        _project: Option<&str>,
-        _metadata: Option<&str>,
+        id: &str,
+        agent: &str,
+        project: Option<&str>,
+        metadata: Option<&str>,
     ) -> IcmResult<String> {
-        unsupported("transcript.ensure_session")
+        if self.readonly {
+            return Err(IcmError::ReadOnly("ensure_session".into()));
+        }
+        // ON CONFLICT DO NOTHING keeps the first row stable across re-fires
+        // (the id is the host agent's own session id).
+        let now = Utc::now();
+        let meta = metadata.unwrap_or("{}");
+        let mut c = self.conn()?;
+        c.execute(
+            "INSERT INTO sessions (id, agent, project, started_at, updated_at, metadata)
+             VALUES ($1, $2, $3, $4, $4, $5)
+             ON CONFLICT (id) DO NOTHING",
+            &[&id, &agent, &project, &now, &meta],
+        )
+        .map_err(pg_err)?;
+        Ok(id.to_string())
     }
-    fn get_session(&self, _id: &str) -> IcmResult<Option<Session>> {
-        unsupported("transcript.get_session")
+
+    fn get_session(&self, id: &str) -> IcmResult<Option<Session>> {
+        let mut c = self.conn()?;
+        let row = c
+            .query_opt(
+                &format!("SELECT {SESSION_COLS} FROM sessions WHERE id = $1"),
+                &[&id],
+            )
+            .map_err(pg_err)?;
+        row.as_ref().map(row_to_session).transpose()
     }
-    fn list_sessions(&self, _project: Option<&str>, _limit: usize) -> IcmResult<Vec<Session>> {
-        unsupported("transcript.list_sessions")
+
+    fn list_sessions(&self, project: Option<&str>, limit: usize) -> IcmResult<Vec<Session>> {
+        let mut c = self.conn()?;
+        let lim = limit as i64;
+        let rows = match project {
+            Some(p) => c
+                .query(
+                    &format!(
+                        "SELECT {SESSION_COLS} FROM sessions WHERE project = $1
+                         ORDER BY updated_at DESC LIMIT $2"
+                    ),
+                    &[&p, &lim],
+                )
+                .map_err(pg_err)?,
+            None => c
+                .query(
+                    &format!(
+                        "SELECT {SESSION_COLS} FROM sessions ORDER BY updated_at DESC LIMIT $1"
+                    ),
+                    &[&lim],
+                )
+                .map_err(pg_err)?,
+        };
+        rows.iter().map(row_to_session).collect()
     }
+
     fn record_message(
         &self,
-        _session_id: &str,
-        _role: Role,
-        _content: &str,
-        _tool_name: Option<&str>,
-        _tokens: Option<i64>,
-        _metadata: Option<&str>,
+        session_id: &str,
+        role: Role,
+        content: &str,
+        tool_name: Option<&str>,
+        tokens: Option<i64>,
+        metadata: Option<&str>,
     ) -> IcmResult<String> {
-        unsupported("transcript.record_message")
+        if self.readonly {
+            return Err(IcmError::ReadOnly("record_message".into()));
+        }
+        let msg = Message::new(
+            session_id.to_string(),
+            role,
+            content.to_string(),
+            tool_name.map(str::to_string),
+            tokens,
+            metadata.map(str::to_string),
+        );
+        let mut c = self.conn()?;
+        // Friendlier NotFound than a raw FK violation.
+        let exists: bool = c
+            .query_one(
+                "SELECT COUNT(*) > 0 FROM sessions WHERE id = $1",
+                &[&session_id],
+            )
+            .map_err(pg_err)?
+            .try_get(0)
+            .map_err(pg_err)?;
+        if !exists {
+            return Err(IcmError::NotFound(format!(
+                "session {session_id} does not exist"
+            )));
+        }
+        // Insert the message and bump the session mtime atomically.
+        let mut tx = c.transaction().map_err(pg_err)?;
+        tx.execute(
+            "INSERT INTO messages (id, session_id, role, content, tool_name, tokens, ts, metadata)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            &[
+                &msg.id,
+                &msg.session_id,
+                &msg.role.as_str(),
+                &msg.content,
+                &msg.tool_name,
+                &msg.tokens,
+                &msg.ts,
+                &msg.metadata,
+            ],
+        )
+        .map_err(pg_err)?;
+        tx.execute(
+            "UPDATE sessions SET updated_at = $1 WHERE id = $2",
+            &[&msg.ts, &session_id],
+        )
+        .map_err(pg_err)?;
+        tx.commit().map_err(pg_err)?;
+        Ok(msg.id)
     }
+
     fn list_session_messages(
         &self,
-        _session_id: &str,
-        _limit: usize,
-        _offset: usize,
+        session_id: &str,
+        limit: usize,
+        offset: usize,
     ) -> IcmResult<Vec<Message>> {
-        unsupported("transcript.list_session_messages")
+        let mut c = self.conn()?;
+        let (lim, off) = (limit as i64, offset as i64);
+        let rows = c
+            .query(
+                &format!(
+                    "SELECT {MESSAGE_COLS} FROM messages WHERE session_id = $1
+                     ORDER BY ts ASC LIMIT $2 OFFSET $3"
+                ),
+                &[&session_id, &lim, &off],
+            )
+            .map_err(pg_err)?;
+        rows.iter().map(row_to_message).collect()
     }
+
     fn search_transcripts(
         &self,
-        _query: &str,
-        _session_id: Option<&str>,
-        _project: Option<&str>,
-        _limit: usize,
+        query: &str,
+        session_id: Option<&str>,
+        project: Option<&str>,
+        limit: usize,
     ) -> IcmResult<Vec<TranscriptHit>> {
-        unsupported("transcript.search_transcripts")
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let lim = limit as i64;
+        // ts_rank scores higher = better (TranscriptHit.score is
+        // higher-is-better; the SQLite backend negates bm25 to match).
+        // Message columns are m.-prefixed: `id`/`metadata` collide with the
+        // joined sessions table otherwise.
+        let mut sql = String::from(
+            "SELECT m.id, m.session_id, m.role, m.content, m.tool_name, m.tokens, m.ts, m.metadata,
+                    s.id, s.agent, s.project, s.started_at, s.updated_at, s.metadata,
+                    ts_rank(m.fts, plainto_tsquery('simple', $1)) AS score
+             FROM messages m
+             JOIN sessions s ON s.id = m.session_id
+             WHERE m.fts @@ plainto_tsquery('simple', $1)",
+        );
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&query];
+        let mut idx = 1;
+        if let Some(sid) = session_id.as_ref() {
+            idx += 1;
+            sql.push_str(&format!(" AND m.session_id = ${idx}"));
+            params.push(sid);
+        }
+        if let Some(p) = project.as_ref() {
+            idx += 1;
+            sql.push_str(&format!(" AND s.project = ${idx}"));
+            params.push(p);
+        }
+        idx += 1;
+        sql.push_str(&format!(" ORDER BY score DESC LIMIT ${idx}"));
+        params.push(&lim);
+
+        let mut c = self.conn()?;
+        let rows = c.query(sql.as_str(), &params).map_err(pg_err)?;
+        let mut hits = Vec::with_capacity(rows.len());
+        for row in &rows {
+            // Message columns 0..=7, session columns 8..=13, score at 14.
+            let role_str: String = row.try_get(2).map_err(pg_err)?;
+            let message = Message {
+                id: row.try_get(0).map_err(pg_err)?,
+                session_id: row.try_get(1).map_err(pg_err)?,
+                role: Role::parse(&role_str).unwrap_or(Role::Tool),
+                content: row.try_get(3).map_err(pg_err)?,
+                tool_name: row.try_get(4).map_err(pg_err)?,
+                tokens: row.try_get(5).map_err(pg_err)?,
+                ts: row.try_get(6).map_err(pg_err)?,
+                metadata: row.try_get(7).map_err(pg_err)?,
+            };
+            let session = Session {
+                id: row.try_get(8).map_err(pg_err)?,
+                agent: row.try_get(9).map_err(pg_err)?,
+                project: row.try_get(10).map_err(pg_err)?,
+                started_at: row.try_get(11).map_err(pg_err)?,
+                updated_at: row.try_get(12).map_err(pg_err)?,
+                metadata: row.try_get(13).map_err(pg_err)?,
+            };
+            let score: f32 = row.try_get(14).map_err(pg_err)?;
+            hits.push(TranscriptHit {
+                message,
+                session,
+                score: score as f64,
+            });
+        }
+        Ok(hits)
     }
-    fn forget_session(&self, _id: &str) -> IcmResult<()> {
-        unsupported("transcript.forget_session")
+
+    fn forget_session(&self, id: &str) -> IcmResult<()> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("forget_session".into()));
+        }
+        // Messages drop via ON DELETE CASCADE; delete explicitly too so the
+        // behavior holds even if the FK were ever dropped.
+        let mut c = self.conn()?;
+        let mut tx = c.transaction().map_err(pg_err)?;
+        tx.execute("DELETE FROM messages WHERE session_id = $1", &[&id])
+            .map_err(pg_err)?;
+        tx.execute("DELETE FROM sessions WHERE id = $1", &[&id])
+            .map_err(pg_err)?;
+        tx.commit().map_err(pg_err)?;
+        Ok(())
     }
+
     fn transcript_stats(&self) -> IcmResult<TranscriptStats> {
-        unsupported("transcript.transcript_stats")
+        let mut c = self.conn()?;
+        let scalar_i64 = |c: &mut MutexGuard<'_, Client>, sql: &str| -> IcmResult<i64> {
+            c.query_one(sql, &[]).map_err(pg_err)?.try_get(0).map_err(pg_err)
+        };
+        let total_sessions = scalar_i64(&mut c, "SELECT COUNT(*) FROM sessions")? as usize;
+        let total_messages = scalar_i64(&mut c, "SELECT COUNT(*) FROM messages")? as usize;
+        let total_bytes =
+            scalar_i64(&mut c, "SELECT COALESCE(SUM(length(content)), 0) FROM messages")? as u64;
+
+        let pairs = |c: &mut MutexGuard<'_, Client>, sql: &str| -> IcmResult<Vec<(String, usize)>> {
+            let rows = c.query(sql, &[]).map_err(pg_err)?;
+            let mut out = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let k: String = row.try_get(0).map_err(pg_err)?;
+                let n: i64 = row.try_get(1).map_err(pg_err)?;
+                out.push((k, n as usize));
+            }
+            Ok(out)
+        };
+        let by_role = pairs(
+            &mut c,
+            "SELECT role, COUNT(*) FROM messages GROUP BY role ORDER BY 2 DESC",
+        )?;
+        let by_agent = pairs(
+            &mut c,
+            "SELECT agent, COUNT(*) FROM sessions GROUP BY agent ORDER BY 2 DESC",
+        )?;
+        let top_sessions = pairs(
+            &mut c,
+            "SELECT session_id, COUNT(*) FROM messages
+             GROUP BY session_id ORDER BY 2 DESC LIMIT 10",
+        )?;
+
+        let row = c
+            .query_one("SELECT MIN(ts), MAX(ts) FROM messages", &[])
+            .map_err(pg_err)?;
+        let oldest: Option<DateTime<Utc>> = row.try_get(0).map_err(pg_err)?;
+        let newest: Option<DateTime<Utc>> = row.try_get(1).map_err(pg_err)?;
+
+        Ok(TranscriptStats {
+            total_sessions,
+            total_messages,
+            total_bytes,
+            by_role,
+            by_agent,
+            top_sessions,
+            oldest,
+            newest,
+        })
     }
 }
 
@@ -2336,5 +2620,53 @@ mod pg_tests {
         // delete.
         s.delete_feedback(&id).unwrap();
         assert!(s.list_feedback(None, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pg_transcript_store_search_replay() {
+        let Some(s) = pg() else {
+            return;
+        };
+        reset(&s);
+        let sid = s.ensure_session("sess-1", "claude", Some("icm"), None).unwrap();
+        // ensure_session is idempotent — same id on re-fire.
+        assert_eq!(
+            s.ensure_session("sess-1", "claude", Some("icm"), None).unwrap(),
+            sid
+        );
+        s.record_message(&sid, Role::User, "how does routing work", None, None, None)
+            .unwrap();
+        s.record_message(
+            &sid,
+            Role::Assistant,
+            "routing uses the store enum",
+            None,
+            Some(12),
+            None,
+        )
+        .unwrap();
+        // Chronological replay.
+        let msgs = s.list_session_messages(&sid, 100, 0).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, Role::User);
+        assert_eq!(msgs[1].tokens, Some(12));
+        // tsvector search, scoped by project.
+        let hits = s.search_transcripts("routing", None, Some("icm"), 10).unwrap();
+        assert!(!hits.is_empty());
+        assert!(hits
+            .iter()
+            .all(|h| h.session.project.as_deref() == Some("icm")));
+        // recording into a missing session is a typed NotFound, not an FK panic.
+        assert!(s
+            .record_message("nope", Role::User, "x", None, None, None)
+            .is_err());
+        // stats.
+        let st = s.transcript_stats().unwrap();
+        assert_eq!(st.total_sessions, 1);
+        assert_eq!(st.total_messages, 2);
+        // cascade delete.
+        s.forget_session(&sid).unwrap();
+        assert!(s.get_session(&sid).unwrap().is_none());
+        assert_eq!(s.list_session_messages(&sid, 100, 0).unwrap().len(), 0);
     }
 }
