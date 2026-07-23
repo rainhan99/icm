@@ -345,6 +345,24 @@ impl PostgresStore {
         self.client.lock().map_err(|_| lock_err())
     }
 
+    /// Set the RLS tenant GUC (`app.tenant`) for subsequent queries on this
+    /// connection (F-003b). **Injection-safe**: the tenant is a bound
+    /// parameter to `set_config`, never string-interpolated into `SET`.
+    /// `None` clears it to `''` → the RLS policy treats it as unrestricted
+    /// (today's single-dataset behavior). Session-scoped on the shared
+    /// connection, so the caller must hold the store lock across this call
+    /// and the following query (a future connection pool would need
+    /// `SET LOCAL` inside a transaction instead).
+    pub fn set_tenant(&self, tenant: Option<&str>) -> IcmResult<()> {
+        let mut c = self.conn()?;
+        c.execute(
+            "SELECT set_config('app.tenant', $1, false)",
+            &[&tenant.unwrap_or("")],
+        )
+        .map_err(pg_err)?;
+        Ok(())
+    }
+
     /// Resolve the connection string from the environment.
     fn conn_string() -> IcmResult<String> {
         std::env::var("ICM_POSTGRES_URL")
@@ -1205,6 +1223,70 @@ fn init_schema(client: &mut Client, requested_dims: usize) -> IcmResult<usize> {
             "INSERT INTO icm_metadata (key, value) VALUES ('embedding_dims', $1)
              ON CONFLICT (key) DO NOTHING",
             &[&dims.to_string()],
+        )
+        .map_err(pg_err)?;
+
+    // F-003b: tenant column + auto-tag defaults + legacy backfill.
+    // `memories` was excluded by F-003a — add it here. All eight
+    // tenant-scoped tables get DEFAULT current_setting('app.tenant', true)
+    // so a write auto-tags with the connection's tenant (NULL when unset =
+    // unrestricted). Backfill legacy NULL-tenant rows to 'default' — run
+    // BEFORE the RLS FORCE below so it is never blocked by a policy.
+    // Idempotent: ADD COLUMN IF NOT EXISTS, re-runnable ALTER, no-op UPDATE.
+    client
+        .batch_execute(
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS tenant TEXT;
+             ALTER TABLE memories      ALTER COLUMN tenant SET DEFAULT current_setting('app.tenant', true);
+             ALTER TABLE facts         ALTER COLUMN tenant SET DEFAULT current_setting('app.tenant', true);
+             ALTER TABLE memoirs       ALTER COLUMN tenant SET DEFAULT current_setting('app.tenant', true);
+             ALTER TABLE concepts      ALTER COLUMN tenant SET DEFAULT current_setting('app.tenant', true);
+             ALTER TABLE concept_links ALTER COLUMN tenant SET DEFAULT current_setting('app.tenant', true);
+             ALTER TABLE feedback      ALTER COLUMN tenant SET DEFAULT current_setting('app.tenant', true);
+             ALTER TABLE sessions      ALTER COLUMN tenant SET DEFAULT current_setting('app.tenant', true);
+             ALTER TABLE messages      ALTER COLUMN tenant SET DEFAULT current_setting('app.tenant', true);
+
+             UPDATE memories      SET tenant = 'default' WHERE tenant IS NULL;
+             UPDATE facts         SET tenant = 'default' WHERE tenant IS NULL;
+             UPDATE memoirs       SET tenant = 'default' WHERE tenant IS NULL;
+             UPDATE concepts      SET tenant = 'default' WHERE tenant IS NULL;
+             UPDATE concept_links SET tenant = 'default' WHERE tenant IS NULL;
+             UPDATE feedback      SET tenant = 'default' WHERE tenant IS NULL;
+             UPDATE sessions      SET tenant = 'default' WHERE tenant IS NULL;
+             UPDATE messages      SET tenant = 'default' WHERE tenant IS NULL;",
+        )
+        .map_err(pg_err)?;
+
+    // F-003b: Row-Level Security. Every read/write is filtered to the
+    // connection's tenant (`current_setting('app.tenant', true)`); an unset
+    // GUC (NULL/'') means unrestricted — today's single-dataset behavior and
+    // the direct-CLI/admin view. FORCE ROW LEVEL SECURITY so even the table
+    // owner is filtered. Idempotent: ENABLE/FORCE are no-ops when already on;
+    // policies use DROP IF EXISTS + CREATE (CREATE POLICY has no IF NOT
+    // EXISTS). The DO loop applies the identical policy to all eight
+    // tenant-scoped tables; `format('%I', t)` safely quotes each identifier.
+    client
+        .batch_execute(
+            "DO $do$
+             DECLARE t text;
+             BEGIN
+               FOREACH t IN ARRAY ARRAY[
+                 'memories','facts','memoirs','concepts',
+                 'concept_links','feedback','sessions','messages'
+               ] LOOP
+                 EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
+                 EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
+                 EXECUTE format('DROP POLICY IF EXISTS icm_tenant_isolation ON %I', t);
+                 EXECUTE format($pol$
+                   CREATE POLICY icm_tenant_isolation ON %I
+                     USING (current_setting('app.tenant', true) IS NULL
+                         OR current_setting('app.tenant', true) = ''
+                         OR tenant = current_setting('app.tenant', true))
+                     WITH CHECK (current_setting('app.tenant', true) IS NULL
+                         OR current_setting('app.tenant', true) = ''
+                         OR tenant = current_setting('app.tenant', true))
+                 $pol$, t);
+               END LOOP;
+             END $do$;",
         )
         .map_err(pg_err)?;
 
@@ -3339,5 +3421,121 @@ mod pg_tests {
         let l = s.get_links_from(&a).unwrap().pop().unwrap();
         s.delete_link(&l.id).unwrap();
         assert_eq!(s.get_links_from(&a).unwrap().len(), 0);
+    }
+
+    /// Read the connection's current `app.tenant` GUC ("" when unset).
+    fn current_setting(s: &PostgresStore) -> String {
+        let mut c = s.conn().expect("lock");
+        c.query_one("SELECT current_setting('app.tenant', true)", &[])
+            .expect("query")
+            .try_get::<_, Option<String>>(0)
+            .expect("get")
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn rls_set_tenant_roundtrip() {
+        let Some(s) = pg() else {
+            return;
+        };
+        s.set_tenant(Some("tenant-x")).unwrap();
+        assert_eq!(current_setting(&s), "tenant-x");
+        s.set_tenant(None).unwrap();
+        assert_eq!(current_setting(&s), "");
+        // An injection attempt is inert — treated as a literal tenant name.
+        s.set_tenant(Some("x'; DROP TABLE memories;--")).unwrap();
+        assert!(s.count().is_ok(), "memories table survives");
+        assert_eq!(current_setting(&s), "x'; DROP TABLE memories;--");
+        s.set_tenant(None).unwrap();
+    }
+
+    /// Read the `tenant` column of a single row (bypasses nothing — used to
+    /// prove auto-tagging; safe to call under any tenant that can see it).
+    fn tenant_of_row(s: &PostgresStore, table: &str, id: &str) -> String {
+        let mut c = s.conn().expect("lock");
+        c.query_one(&format!("SELECT tenant FROM {table} WHERE id = $1"), &[&id])
+            .expect("query")
+            .try_get::<_, Option<String>>(0)
+            .expect("get")
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn rls_schema_and_autotag() {
+        let Some(s) = pg() else {
+            return;
+        };
+        reset(&s);
+        // memories gained a tenant column (F-003a only did the other 7).
+        assert!(
+            table_columns(&s, "memories").iter().any(|c| c == "tenant"),
+            "memories.tenant added"
+        );
+        // A write under a set tenant auto-tags via the column DEFAULT.
+        s.set_tenant(Some("acme")).unwrap();
+        let id = s
+            .store(Memory::new("t".into(), "hi".into(), Importance::High))
+            .unwrap();
+        assert_eq!(tenant_of_row(&s, "memories", &id), "acme");
+        s.set_tenant(None).unwrap();
+    }
+
+    /// A store whose connection has dropped to a **non-superuser** role via
+    /// `SET ROLE`. RLS (even FORCE) is bypassed by superusers/owners-without-
+    /// FORCE, and the test container's `icm` role is a superuser — so proving
+    /// isolation requires querying as a non-superuser, mirroring the
+    /// production requirement (documented in docs/postgres-backend.md).
+    /// Schema + truncate run first as the owner; then we grant a minimal
+    /// non-superuser role and switch to it.
+    fn pg_rls() -> Option<PostgresStore> {
+        let s = pg()?;
+        reset(&s); // owner truncates before we drop privileges
+        {
+            let mut c = s.conn().expect("lock");
+            c.batch_execute(
+                "DO $$ BEGIN
+                   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'icm_rls') THEN
+                     CREATE ROLE icm_rls NOSUPERUSER;
+                   END IF;
+                 END $$;
+                 GRANT USAGE ON SCHEMA public TO icm_rls;
+                 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO icm_rls;
+                 SET ROLE icm_rls;",
+            )
+            .expect("grant + SET ROLE icm_rls");
+        }
+        Some(s)
+    }
+
+    #[test]
+    fn rls_isolation_across_tenants() {
+        let Some(s) = pg_rls() else {
+            return;
+        };
+        // Tenant A stores a row; tenant B stores a row.
+        s.set_tenant(Some("A")).unwrap();
+        let a = s
+            .store(Memory::new("t".into(), "A secret".into(), Importance::High))
+            .unwrap();
+        s.set_tenant(Some("B")).unwrap();
+        let b = s
+            .store(Memory::new("t".into(), "B secret".into(), Importance::High))
+            .unwrap();
+
+        // B sees only B — across get and list.
+        assert!(s.get(&a).unwrap().is_none(), "B must not read A's row");
+        assert!(s.get(&b).unwrap().is_some());
+        let listed = s.list_all().unwrap();
+        assert_eq!(listed.len(), 1, "B lists only its own");
+        assert!(listed[0].summary.contains("B secret"));
+
+        // A sees only A.
+        s.set_tenant(Some("A")).unwrap();
+        assert!(s.get(&b).unwrap().is_none(), "A must not read B's row");
+        assert_eq!(s.list_all().unwrap().len(), 1);
+
+        // Unset tenant → unrestricted (today's single-dataset behavior).
+        s.set_tenant(None).unwrap();
+        assert_eq!(s.list_all().unwrap().len(), 2);
     }
 }
