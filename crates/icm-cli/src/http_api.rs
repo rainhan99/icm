@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::Result;
 use axum::{
@@ -45,6 +45,7 @@ use icm_core::{
 use icm_store::Store;
 
 use crate::recall_format::{self, RecallFormat};
+use crate::store_actor::StoreHandle;
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -58,8 +59,9 @@ use crate::recall_format::{self, RecallFormat};
 /// `None` skips semantic recall — the `--no-embeddings` path.
 #[derive(Clone)]
 pub struct AppState {
-    store: Arc<Mutex<Store>>,
-    embedder: Option<Arc<dyn Embedder + Send + Sync>>,
+    /// F-003c: handle to the dedicated store-actor thread (which owns the
+    /// `Store` + embedder). Every store op runs there, off the tokio runtime.
+    store: StoreHandle,
     /// When set, every request must carry `Authorization: Bearer <token>`.
     token: Option<String>,
     /// F-003 token → tenant map. When non-empty it takes precedence over
@@ -68,6 +70,9 @@ pub struct AppState {
     ///
     /// SCAFFOLD: resolves identity only; does NOT isolate tenant data.
     tokens: Option<HashMap<String, String>>,
+    /// Whether the actor holds an embedder (for `/health`). The embedder
+    /// itself lives on the actor thread.
+    has_embedder: bool,
     /// Embedding-cache metrics for `/cache` (F-001). `None` when the
     /// active embedder has no cache (local provider / no embedder).
     cache_metrics: Option<Arc<icm_core::CacheMetrics>>,
@@ -79,12 +84,6 @@ pub struct AppState {
 /// mode (or when auth is disabled).
 #[derive(Clone, Debug)]
 struct Tenant(String);
-
-impl AppState {
-    fn embedder_ref(&self) -> Option<&dyn Embedder> {
-        self.embedder.as_deref().map(|e| e as &dyn Embedder)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Response format negotiation
@@ -189,11 +188,12 @@ pub async fn run_http_server(
     token: Option<String>,
     tokens: Option<HashMap<String, String>>,
 ) -> Result<()> {
+    let has_embedder = embedder.is_some();
     let state = AppState {
-        store: Arc::new(Mutex::new(store)),
-        embedder: embedder.map(Arc::from),
+        store: StoreHandle::spawn(store, embedder)?,
         token,
         tokens,
+        has_embedder,
         cache_metrics,
     };
 
@@ -248,27 +248,21 @@ async fn handle_rpc(
     Extension(tenant): Extension<Tenant>,
     Json(req): Json<icm_core::RpcRequest>,
 ) -> Response {
-    let store = match state.store.lock() {
-        Ok(s) => s,
-        Err(_) => {
-            return err_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "store poisoned",
-                OutputFormat::Json,
-            )
-        }
-    };
-    // F-003b: scope this request to its tenant (RLS) on the SAME locked
-    // store guard as the dispatch below — never split the lock.
-    if let Err(e) = store.set_tenant(Some(&tenant.0)) {
-        return err_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("tenant scope failed: {e}"),
-            OutputFormat::Json,
-        );
+    let method = req.method;
+    let params = req.params;
+    // Dispatch on the store-actor thread; tenant scoping (F-003b) happens in
+    // the same job inside the helper.
+    match blocking_store(
+        &state,
+        Some(&tenant),
+        OutputFormat::Json,
+        move |store, emb| crate::rpc_dispatch::dispatch(store, emb, &method, params),
+    )
+    .await
+    {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => e,
     }
-    let resp = crate::rpc_dispatch::dispatch(&store, state.embedder_ref(), &req.method, req.params);
-    Json(resp).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -365,9 +359,14 @@ async fn handle_recall(
     Json(req): Json<RecallReq>,
 ) -> Response {
     let format = OutputFormat::resolve(&q, &headers);
-    match run_recall(&state, &req, &tenant) {
-        Ok(results) => render_recall(&results, format),
-        Err(e) => err_response(StatusCode::BAD_REQUEST, &e.to_string(), format),
+    match blocking_store(&state, Some(&tenant), format, move |store, emb| {
+        run_recall(store, emb, &req)
+    })
+    .await
+    {
+        Ok(Ok(results)) => render_recall(&results, format),
+        Ok(Err(e)) => err_response(StatusCode::BAD_REQUEST, &e.to_string(), format),
+        Err(e) => e,
     }
 }
 
@@ -377,21 +376,15 @@ async fn handle_recall(
 /// Reuses the same store methods so behavior stays consistent across
 /// transports.
 fn run_recall(
-    state: &AppState,
+    store: &Store,
+    embedder: Option<&dyn Embedder>,
     req: &RecallReq,
-    tenant: &Tenant,
 ) -> Result<Vec<(Memory, Option<f32>)>> {
     if req.query.trim().is_empty() {
         anyhow::bail!("missing required field: query");
     }
-    let store = state
-        .store
-        .lock()
-        .map_err(|_| anyhow::anyhow!("store poisoned"))?;
-    // F-003b: scope to tenant (RLS) inside the SAME lock as the search.
-    store
-        .set_tenant(Some(&tenant.0))
-        .map_err(|e| anyhow::anyhow!("tenant scope failed: {e}"))?;
+    // The store is already locked (owned by the actor) + tenant-scoped by
+    // `blocking_store`.
     if let Err(e) = store.maybe_auto_decay() {
         tracing::warn!(error = %e, "auto-decay failed during /recall");
     }
@@ -405,7 +398,7 @@ fn run_recall(
         }
     };
 
-    let scored: Vec<(Memory, Option<f32>)> = if let Some(emb) = state.embedder_ref() {
+    let scored: Vec<(Memory, Option<f32>)> = if let Some(emb) = embedder {
         match emb.embed_query(&req.query) {
             Ok(q_emb) => match store.search_hybrid(&req.query, &q_emb, limit) {
                 Ok(rows) => rows
@@ -423,12 +416,12 @@ fn run_recall(
                     })
                     .map(|(m, s)| (m, Some(s)))
                     .collect(),
-                Err(_) => fts_fallback(&store, req, &project_filter, limit)?,
+                Err(_) => fts_fallback(store, req, &project_filter, limit)?,
             },
-            Err(_) => fts_fallback(&store, req, &project_filter, limit)?,
+            Err(_) => fts_fallback(store, req, &project_filter, limit)?,
         }
     } else {
-        fts_fallback(&store, req, &project_filter, limit)?
+        fts_fallback(store, req, &project_filter, limit)?
     };
 
     // Best-effort access bookkeeping (matches the MCP path).
@@ -516,32 +509,27 @@ async fn handle_store(
     if let Some(raw) = req.raw.as_deref().filter(|s| !s.is_empty()) {
         mem.raw_excerpt = Some(raw.to_string());
     }
-    if let Some(emb) = state.embedder_ref() {
-        if let Ok(v) = emb.embed(&format!("{} {}", mem.topic, mem.summary)) {
-            mem.embedding = Some(v);
-        }
-    }
 
-    let outcome = match state.store.lock() {
-        Ok(store) => {
-            if let Some(r) = scope_tenant(&store, &tenant, format) {
-                return r;
+    // Embed + store in one actor job (the embed is a blocking call too).
+    match blocking_store(&state, Some(&tenant), format, move |store, emb| {
+        if let Some(e) = emb {
+            if let Ok(v) = e.embed(&format!("{} {}", mem.topic, mem.summary)) {
+                mem.embedding = Some(v);
             }
-            store.store(mem.clone())
         }
-        Err(_) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, "store poisoned", format),
-    };
-    match outcome {
-        Ok(id) => {
-            let mut stored = mem;
-            stored.id = id;
-            render_recall(&[(stored, None)], format)
+        match store.store(mem.clone()) {
+            Ok(id) => {
+                mem.id = id;
+                Ok(mem)
+            }
+            Err(e) => Err(format!("store failed: {e}")),
         }
-        Err(e) => err_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("store failed: {e}"),
-            format,
-        ),
+    })
+    .await
+    {
+        Ok(Ok(stored)) => render_recall(&[(stored, None)], format),
+        Ok(Err(msg)) => err_response(StatusCode::INTERNAL_SERVER_ERROR, &msg, format),
+        Err(e) => e,
     }
 }
 
@@ -590,49 +578,50 @@ async fn handle_consolidate(
     if req.topic.trim().is_empty() {
         return err_response(StatusCode::BAD_REQUEST, "topic required", format);
     }
-    let store = match state.store.lock() {
-        Ok(s) => s,
-        Err(_) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, "store poisoned", format),
-    };
-    if let Some(r) = scope_tenant(&store, &tenant, format) {
-        return r;
-    }
-    let topic_memories = match store.get_by_topic(&req.topic) {
-        Ok(ms) => ms,
-        Err(e) => {
-            return err_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("topic lookup failed: {e}"),
-                format,
-            )
-        }
-    };
-    if topic_memories.is_empty() {
-        return err_response(
-            StatusCode::NOT_FOUND,
-            &format!("no memories under topic {:?}", req.topic),
-            format,
-        );
-    }
-    let summary = topic_memories
-        .iter()
-        .map(|m| m.summary.as_str())
-        .collect::<Vec<_>>()
-        .join(" | ");
-    let consolidated = Memory::new(req.topic.clone(), summary, Importance::High);
-
-    let result = if req.keep_originals {
-        store.store(consolidated.clone()).map(|_| ())
-    } else {
-        store.consolidate_topic(&req.topic, consolidated.clone())
-    };
-    match result {
-        Ok(()) => render_recall(&[(consolidated, None)], format),
-        Err(e) => err_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("consolidate failed: {e}"),
-            format,
-        ),
+    let topic = req.topic.clone();
+    let keep = req.keep_originals;
+    match blocking_store(
+        &state,
+        Some(&tenant),
+        format,
+        move |store, _emb| -> Result<Memory, (StatusCode, String)> {
+            let mems = store.get_by_topic(&topic).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("topic lookup failed: {e}"),
+                )
+            })?;
+            if mems.is_empty() {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    format!("no memories under topic {topic:?}"),
+                ));
+            }
+            let summary = mems
+                .iter()
+                .map(|m| m.summary.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let consolidated = Memory::new(topic.clone(), summary, Importance::High);
+            let r = if keep {
+                store.store(consolidated.clone()).map(|_| ())
+            } else {
+                store.consolidate_topic(&topic, consolidated.clone())
+            };
+            r.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("consolidate failed: {e}"),
+                )
+            })?;
+            Ok(consolidated)
+        },
+    )
+    .await
+    {
+        Ok(Ok(consolidated)) => render_recall(&[(consolidated, None)], format),
+        Ok(Err((code, msg))) => err_response(code, &msg, format),
+        Err(e) => e,
     }
 }
 
@@ -647,15 +636,14 @@ async fn handle_stats(
     Query(q): Query<FormatQuery>,
 ) -> Response {
     let format = OutputFormat::resolve(&q, &headers);
-    let store = match state.store.lock() {
-        Ok(s) => s,
-        Err(_) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, "store poisoned", format),
-    };
-    if let Some(r) = scope_tenant(&store, &tenant, format) {
-        return r;
-    }
-    match store.stats() {
-        Ok(s) => {
+    let stats = blocking_store(&state, Some(&tenant), format, move |store, _emb| {
+        store.stats().map_err(|e| format!("stats failed: {e}"))
+    })
+    .await;
+    match stats {
+        Err(e) => e,
+        Ok(Err(msg)) => err_response(StatusCode::INTERNAL_SERVER_ERROR, &msg, format),
+        Ok(Ok(s)) => {
             let payload = json!({
                 "total_memories": s.total_memories,
                 "total_topics": s.total_topics,
@@ -684,11 +672,6 @@ async fn handle_stats(
                 }
             }
         }
-        Err(e) => err_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("stats failed: {e}"),
-            format,
-        ),
     }
 }
 
@@ -703,37 +686,34 @@ async fn handle_topics(
     Query(q): Query<FormatQuery>,
 ) -> Response {
     let format = OutputFormat::resolve(&q, &headers);
-    let store = match state.store.lock() {
-        Ok(s) => s,
-        Err(_) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, "store poisoned", format),
+    let topics = blocking_store(&state, Some(&tenant), format, move |store, _emb| {
+        store
+            .list_topics()
+            .map_err(|e| format!("topics failed: {e}"))
+    })
+    .await;
+    let rows = match topics {
+        Err(e) => return e,
+        Ok(Err(msg)) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, &msg, format),
+        Ok(Ok(rows)) => rows,
     };
-    if let Some(r) = scope_tenant(&store, &tenant, format) {
-        return r;
-    }
-    match store.list_topics() {
-        Ok(rows) => match format {
-            OutputFormat::Json => json_value_response(json!(rows
-                .iter()
-                .map(|(t, n)| json!({"topic": t, "count": n}))
-                .collect::<Vec<_>>())),
-            OutputFormat::Toon => {
-                let mut body = format!("topics[{}]{{topic,count}}:\n", rows.len());
-                for (t, n) in &rows {
-                    let topic = if t.contains(',') || t.contains('"') {
-                        format!("\"{}\"", t.replace('"', "\"\""))
-                    } else {
-                        t.clone()
-                    };
-                    body.push_str(&format!("  {topic},{n}\n"));
-                }
-                toon_response(body)
+    match format {
+        OutputFormat::Json => json_value_response(json!(rows
+            .iter()
+            .map(|(t, n)| json!({"topic": t, "count": n}))
+            .collect::<Vec<_>>())),
+        OutputFormat::Toon => {
+            let mut body = format!("topics[{}]{{topic,count}}:\n", rows.len());
+            for (t, n) in &rows {
+                let topic = if t.contains(',') || t.contains('"') {
+                    format!("\"{}\"", t.replace('"', "\"\""))
+                } else {
+                    t.clone()
+                };
+                body.push_str(&format!("  {topic},{n}\n"));
             }
-        },
-        Err(e) => err_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("topics failed: {e}"),
-            format,
-        ),
+            toon_response(body)
+        }
     }
 }
 
@@ -834,7 +814,7 @@ struct Health {
 async fn handle_health(State(state): State<AppState>) -> Json<Health> {
     Json(Health {
         status: "ok",
-        has_embedder: state.embedder.is_some(),
+        has_embedder: state.has_embedder,
     })
 }
 
@@ -883,18 +863,46 @@ fn err_response(status: StatusCode, msg: &str, format: OutputFormat) -> Response
     }
 }
 
-/// F-003b: scope the (already-locked) store to the request's tenant for RLS.
-/// Returns `Some(error_response)` to early-return on failure, `None` on
-/// success. MUST be called under the SAME lock guard as the query that
-/// follows so a concurrent request cannot change the tenant in between.
-fn scope_tenant(store: &Store, tenant: &Tenant, format: OutputFormat) -> Option<Response> {
-    store.set_tenant(Some(&tenant.0)).err().map(|e| {
-        err_response(
+/// F-003c: run a store operation `f` on the store-actor thread (off the tokio
+/// runtime, so the blocking Postgres client works). When `tenant` is `Some`,
+/// the store is scoped for RLS (F-003b) in the **same** actor job as `f` — the
+/// actor runs one job at a time, so tenant + query are atomic. Maps a tenant
+/// failure or a dead/panicked actor to a 500 in `format`.
+async fn blocking_store<T, F>(
+    state: &AppState,
+    tenant: Option<&Tenant>,
+    format: OutputFormat,
+    f: F,
+) -> Result<T, Response>
+where
+    F: FnOnce(&Store, Option<&dyn Embedder>) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let tenant = tenant.map(|t| t.0.clone());
+    let out = state
+        .store
+        .run(move |store, emb| -> Result<T, String> {
+            if let Some(t) = tenant.as_deref() {
+                store
+                    .set_tenant(Some(t))
+                    .map_err(|e| format!("tenant scope failed: {e}"))?;
+            }
+            Ok(f(store, emb))
+        })
+        .await;
+    match out {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(msg)) => Err(err_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("tenant scope failed: {e}"),
+            &msg,
             format,
-        )
-    })
+        )),
+        Err(_) => Err(err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "store actor unavailable",
+            format,
+        )),
+    }
 }
 
 #[cfg(all(test, feature = "remote-store"))]
@@ -906,10 +914,10 @@ mod rpc_tests {
 
     fn test_state(token: Option<&str>) -> AppState {
         AppState {
-            store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
-            embedder: None,
+            store: StoreHandle::spawn(Store::in_memory().unwrap(), None).unwrap(),
             token: token.map(str::to_string),
             tokens: None,
+            has_embedder: false,
             cache_metrics: None,
         }
     }
@@ -929,10 +937,10 @@ mod rpc_tests {
             .map(|(t, tn)| (t.to_string(), tn.to_string()))
             .collect();
         AppState {
-            store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
-            embedder: None,
+            store: StoreHandle::spawn(Store::in_memory().unwrap(), None).unwrap(),
             token: None,
             tokens: Some(map),
+            has_embedder: false,
             cache_metrics: None,
         }
     }
@@ -1039,6 +1047,62 @@ mod rpc_tests {
             .unwrap();
         assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
     }
+
+    /// A Postgres-backed AppState, or None when ICM_POSTGRES_URL is unset.
+    /// Connects on a plain `std::thread` (off any tokio runtime — the blocking
+    /// PG client can't connect inside one), mirroring production where the
+    /// store is built in sync `cmd_serve` before the server runtime starts,
+    /// then hands the store to the actor.
+    fn pg_app_state() -> Option<AppState> {
+        std::env::var("ICM_POSTGRES_URL").ok()?;
+        let store = std::thread::spawn(|| {
+            std::env::set_var("ICM_DB_BACKEND", "postgres");
+            let s = Store::with_dims(std::path::Path::new("ignored"), 384);
+            std::env::remove_var("ICM_DB_BACKEND");
+            s
+        })
+        .join()
+        .expect("connect thread")
+        .expect("open pg store");
+        Some(AppState {
+            store: StoreHandle::spawn(store, None).expect("spawn actor"),
+            token: Some("secret".to_string()),
+            tokens: None,
+            has_embedder: false,
+            cache_metrics: None,
+        })
+    }
+
+    /// F-003c: a store op over a Postgres-backed HTTP app must return 200, not
+    /// panic with "Cannot start a runtime from within a runtime" (the blocking
+    /// PG client driven on a tokio-managed thread). Gated on ICM_POSTGRES_URL.
+    #[tokio::test]
+    async fn http_pg_store_op_no_runtime_panic() {
+        let Some(state) = pg_app_state() else {
+            return;
+        };
+        let app = build_router(state);
+        let m = Memory::new(
+            "t".to_string(),
+            "pg via http".to_string(),
+            Importance::Medium,
+        );
+        let body = serde_json::json!({"method":"memory.store","params":{"memory": m}}).to_string();
+        let stored = app
+            .clone()
+            .oneshot(rpc_request(Some("secret"), &body))
+            .await
+            .unwrap();
+        assert_eq!(stored.status(), StatusCode::OK);
+        let counted = app
+            .oneshot(rpc_request(
+                Some("secret"),
+                r#"{"method":"memory.count","params":{}}"#,
+            ))
+            .await
+            .unwrap();
+        assert!(body_json(counted).await["result"].is_number());
+    }
 }
 
 #[cfg(test)]
@@ -1131,10 +1195,10 @@ mod cache_tests {
 
     fn test_state(token: Option<&str>) -> AppState {
         AppState {
-            store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
-            embedder: None,
+            store: StoreHandle::spawn(Store::in_memory().unwrap(), None).unwrap(),
             token: token.map(str::to_string),
             tokens: None,
+            has_embedder: false,
             cache_metrics: None,
         }
     }
@@ -1146,10 +1210,10 @@ mod cache_tests {
             .map(|(t, tn)| (t.to_string(), tn.to_string()))
             .collect();
         AppState {
-            store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
-            embedder: None,
+            store: StoreHandle::spawn(Store::in_memory().unwrap(), None).unwrap(),
             token: None,
             tokens: Some(map),
+            has_embedder: false,
             cache_metrics: None,
         }
     }
@@ -1176,10 +1240,10 @@ mod cache_tests {
         metrics.record_miss();
         metrics.record_hit();
         let state = AppState {
-            store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
-            embedder: None,
+            store: StoreHandle::spawn(Store::in_memory().unwrap(), None).unwrap(),
             token: None,
             tokens: None,
+            has_embedder: false,
             cache_metrics: Some(Arc::clone(&metrics)),
         };
         let resp = build_router(state)
@@ -1202,10 +1266,10 @@ mod cache_tests {
         let metrics = Arc::new(icm_core::CacheMetrics::default());
         metrics.record_hit();
         let state = AppState {
-            store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
-            embedder: None,
+            store: StoreHandle::spawn(Store::in_memory().unwrap(), None).unwrap(),
             token: None,
             tokens: None,
+            has_embedder: false,
             cache_metrics: Some(metrics),
         };
         let resp = build_router(state)
@@ -1233,10 +1297,10 @@ mod cache_tests {
     #[tokio::test]
     async fn cache_stats_disabled_when_no_metrics() {
         let state = AppState {
-            store: Arc::new(Mutex::new(Store::in_memory().unwrap())),
-            embedder: None,
+            store: StoreHandle::spawn(Store::in_memory().unwrap(), None).unwrap(),
             token: None,
             tokens: None,
+            has_embedder: false,
             cache_metrics: None,
         };
         let resp = build_router(state)

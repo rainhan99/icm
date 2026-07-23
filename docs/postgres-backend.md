@@ -87,6 +87,18 @@ are migrated to the `'default'` tenant on first connect.
 >   serialized). Introducing a **connection pool** later would require
 >   switching to `SET LOCAL` inside a per-request transaction.
 
+## HTTP / web servers over Postgres (F-003c)
+
+`icm serve --http` and `icm serve --web` support the Postgres backend. The
+blocking Postgres client cannot run on a tokio-managed thread (its internal
+`block_on` would panic "Cannot start a runtime from within a runtime" — this
+holds for `spawn_blocking` pool threads too, not just async workers), so both
+servers run every store operation on a **dedicated store-actor thread**
+(a plain `std::thread` that owns the `Store`, off the runtime). This is
+transparent to callers and to the SQLite backend; it also serializes store
+access (as the previous `Mutex` did) and contains any store panic as a `500`
+rather than a downed server.
+
 ## Requirements
 
 PostgreSQL with the [`pgvector`](https://github.com/pgvector/pgvector)

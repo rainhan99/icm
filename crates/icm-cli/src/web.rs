@@ -1,7 +1,5 @@
 //! Web dashboard for ICM — Axum HTTP server with embedded SvelteKit SPA.
 
-use std::sync::{Arc, Mutex};
-
 use anyhow::Result;
 use axum::{
     body::Body,
@@ -19,6 +17,7 @@ use icm_core::{FeedbackStore, MemoirStore, MemoryStore};
 use icm_store::Store;
 
 use crate::config::WebConfig;
+use crate::store_actor::StoreHandle;
 use crate::truncate_at_char_boundary;
 
 // ---------------------------------------------------------------------------
@@ -35,9 +34,24 @@ struct WebAssets;
 
 #[derive(Clone)]
 pub struct AppState {
-    store: Arc<Mutex<Store>>,
+    /// F-003c: handle to the dedicated store-actor thread. The dashboard is
+    /// an admin view — no tenant scoping (unset tenant = unrestricted).
+    store: StoreHandle,
     username: String,
     password: String,
+}
+
+/// Run a store operation on the actor thread (off the tokio runtime, so the
+/// blocking Postgres client works). Maps a dead/panicked actor to a 500.
+async fn blocking_web<T, F>(state: &AppState, f: F) -> Response
+where
+    F: FnOnce(&Store) -> T + Send + 'static,
+    T: IntoResponse + Send + 'static,
+{
+    match state.store.run(move |store, _emb| f(store)).await {
+        Ok(v) => v.into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "store actor unavailable").into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -220,6 +234,18 @@ fn spa_router() -> Router<AppState> {
 // Server entry point
 // ---------------------------------------------------------------------------
 
+/// Build the fully-layered dashboard router. Extracted so tests can drive
+/// handlers via `oneshot` without binding a socket.
+fn web_router(state: AppState) -> Router {
+    api_router()
+        .merge(spa_router())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
+        .with_state(state)
+}
+
 #[tokio::main]
 pub async fn run_web_server(
     store: Store,
@@ -229,18 +255,12 @@ pub async fn run_web_server(
     password: String,
 ) -> Result<()> {
     let state = AppState {
-        store: Arc::new(Mutex::new(store)),
+        store: StoreHandle::spawn(store, None)?,
         username,
         password,
     };
 
-    let app = api_router()
-        .merge(spa_router())
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ))
-        .with_state(state);
+    let app = web_router(state);
 
     let bind = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&bind)
@@ -361,41 +381,42 @@ async fn api_health_check() -> impl IntoResponse {
 }
 
 async fn api_stats(State(state): State<AppState>) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
-    let stats = match store.stats() {
-        Ok(s) => s,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
+    blocking_web(&state, move |store| {
+        let stats = match store.stats() {
+            Ok(s) => s,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
 
-    let feedback_count = store.feedback_stats().map(|f| f.total).unwrap_or(0);
+        let feedback_count = store.feedback_stats().map(|f| f.total).unwrap_or(0);
 
-    // Count memoirs, concepts, links
-    let memoirs = store.list_memoirs().unwrap_or_default();
-    let (mut concepts, mut links) = (0usize, 0usize);
-    for m in &memoirs {
-        if let Ok(ms) = store.memoir_stats(&m.id) {
-            concepts += ms.total_concepts;
-            links += ms.total_links;
+        // Count memoirs, concepts, links
+        let memoirs = store.list_memoirs().unwrap_or_default();
+        let (mut concepts, mut links) = (0usize, 0usize);
+        for m in &memoirs {
+            if let Ok(ms) = store.memoir_stats(&m.id) {
+                concepts += ms.total_concepts;
+                links += ms.total_links;
+            }
         }
-    }
 
-    Json(StatsResponse {
-        total_memories: stats.total_memories,
-        total_topics: stats.total_topics,
-        avg_weight: stats.avg_weight,
-        oldest_memory: stats.oldest_memory.map(|d| d.to_rfc3339()),
-        newest_memory: stats.newest_memory.map(|d| d.to_rfc3339()),
-        total_memoirs: memoirs.len(),
-        total_concepts: concepts,
-        total_links: links,
-        total_feedback: feedback_count,
+        Json(StatsResponse {
+            total_memories: stats.total_memories,
+            total_topics: stats.total_topics,
+            avg_weight: stats.avg_weight,
+            oldest_memory: stats.oldest_memory.map(|d| d.to_rfc3339()),
+            newest_memory: stats.newest_memory.map(|d| d.to_rfc3339()),
+            total_memoirs: memoirs.len(),
+            total_concepts: concepts,
+            total_links: links,
+            total_feedback: feedback_count,
+        })
+        .into_response()
     })
-    .into_response()
+    .await
 }
 
 async fn api_topics(State(state): State<AppState>) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
-    match store.list_topics() {
+    blocking_web(&state, move |store| match store.list_topics() {
         Ok(topics) => Json(
             topics
                 .into_iter()
@@ -404,99 +425,101 @@ async fn api_topics(State(state): State<AppState>) -> impl IntoResponse {
         )
         .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+    })
+    .await
 }
 
 async fn api_topic_detail(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
-    match store.get_by_topic(&name) {
+    blocking_web(&state, move |store| match store.get_by_topic(&name) {
         Ok(memories) => Json(memories).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+    })
+    .await
 }
 
 async fn api_topic_health(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
-    match store.topic_health(&name) {
+    blocking_web(&state, move |store| match store.topic_health(&name) {
         Ok(health) => Json(health).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+    })
+    .await
 }
 
 async fn api_topic_consolidate(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
-    let memories = match store.get_by_topic(&name) {
-        Ok(m) => m,
-        Err(e) => {
+    blocking_web(&state, move |store| {
+        let memories = match store.get_by_topic(&name) {
+            Ok(m) => m,
+            Err(e) => {
+                return Json(ActionResult {
+                    ok: false,
+                    message: e.to_string(),
+                })
+                .into_response()
+            }
+        };
+
+        if memories.is_empty() {
             return Json(ActionResult {
+                ok: false,
+                message: "No memories in topic".into(),
+            })
+            .into_response();
+        }
+
+        // Build consolidated summary
+        let summary: String = memories
+            .iter()
+            .map(|m| m.summary.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let truncated = if summary.len() > 500 {
+            format!("{}...", truncate_at_char_boundary(&summary, 500))
+        } else {
+            summary
+        };
+
+        let mut consolidated = memories[0].clone();
+        consolidated.id = format!(
+            "{:032X}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        consolidated.summary = truncated;
+        consolidated.access_count = 0;
+        consolidated.weight = 1.0;
+
+        match store.consolidate_topic(&name, consolidated) {
+            Ok(_) => Json(ActionResult {
+                ok: true,
+                message: format!("Consolidated {} memories", memories.len()),
+            })
+            .into_response(),
+            Err(e) => Json(ActionResult {
                 ok: false,
                 message: e.to_string(),
             })
-            .into_response()
+            .into_response(),
         }
-    };
-
-    if memories.is_empty() {
-        return Json(ActionResult {
-            ok: false,
-            message: "No memories in topic".into(),
-        })
-        .into_response();
-    }
-
-    // Build consolidated summary
-    let summary: String = memories
-        .iter()
-        .map(|m| m.summary.as_str())
-        .collect::<Vec<_>>()
-        .join(" | ");
-    let truncated = if summary.len() > 500 {
-        format!("{}...", truncate_at_char_boundary(&summary, 500))
-    } else {
-        summary
-    };
-
-    let mut consolidated = memories[0].clone();
-    consolidated.id = format!(
-        "{:032X}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
-    consolidated.summary = truncated;
-    consolidated.access_count = 0;
-    consolidated.weight = 1.0;
-
-    match store.consolidate_topic(&name, consolidated) {
-        Ok(_) => Json(ActionResult {
-            ok: true,
-            message: format!("Consolidated {} memories", memories.len()),
-        })
-        .into_response(),
-        Err(e) => Json(ActionResult {
-            ok: false,
-            message: e.to_string(),
-        })
-        .into_response(),
-    }
+    })
+    .await
 }
 
 async fn api_memories(
     State(state): State<AppState>,
     Query(params): Query<PaginationParams>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
-    match store.list_all() {
+    blocking_web(&state, move |store| match store.list_all() {
         Ok(mut memories) => {
             memories.sort_by(|a, b| {
                 b.weight
@@ -511,26 +534,28 @@ async fn api_memories(
             Json(page).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+    })
+    .await
 }
 
 async fn api_memories_search(
     State(state): State<AppState>,
     Query(params): Query<SearchParams>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
-    match store.search_fts(&params.q, params.limit) {
-        Ok(memories) => Json(memories).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+    blocking_web(&state, move |store| {
+        match store.search_fts(&params.q, params.limit) {
+            Ok(memories) => Json(memories).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
+    })
+    .await
 }
 
 async fn api_memory_delete(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
-    match store.delete(&id) {
+    blocking_web(&state, move |store| match store.delete(&id) {
         Ok(_) => Json(ActionResult {
             ok: true,
             message: format!("Deleted {id}"),
@@ -541,29 +566,31 @@ async fn api_memory_delete(
             message: e.to_string(),
         })
         .into_response(),
-    }
+    })
+    .await
 }
 
 async fn api_health_all(State(state): State<AppState>) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
-    let topics = match store.list_topics() {
-        Ok(t) => t,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
+    blocking_web(&state, move |store| {
+        let topics = match store.list_topics() {
+            Ok(t) => t,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
 
-    let mut health_list = Vec::new();
-    for (name, _) in &topics {
-        if let Ok(h) = store.topic_health(name) {
-            health_list.push(h);
+        let mut health_list = Vec::new();
+        for (name, _) in &topics {
+            if let Ok(h) = store.topic_health(name) {
+                health_list.push(h);
+            }
         }
-    }
 
-    Json(health_list).into_response()
+        Json(health_list).into_response()
+    })
+    .await
 }
 
 async fn api_decay(State(state): State<AppState>) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
-    match store.apply_decay(0.95) {
+    blocking_web(&state, move |store| match store.apply_decay(0.95) {
         Ok(n) => Json(ActionResult {
             ok: true,
             message: format!("Decayed {n} memories"),
@@ -572,12 +599,12 @@ async fn api_decay(State(state): State<AppState>) -> impl IntoResponse {
             ok: false,
             message: e.to_string(),
         }),
-    }
+    })
+    .await
 }
 
 async fn api_prune(State(state): State<AppState>) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
-    match store.prune(0.1) {
+    blocking_web(&state, move |store| match store.prune(0.1) {
         Ok(n) => Json(ActionResult {
             ok: true,
             message: format!("Pruned {n} memories"),
@@ -586,54 +613,103 @@ async fn api_prune(State(state): State<AppState>) -> impl IntoResponse {
             ok: false,
             message: e.to_string(),
         }),
-    }
+    })
+    .await
 }
 
 async fn api_memoirs(State(state): State<AppState>) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
-    let memoirs = match store.list_memoirs() {
-        Ok(m) => m,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
+    blocking_web(&state, move |store| {
+        let memoirs = match store.list_memoirs() {
+            Ok(m) => m,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
 
-    let entries: Vec<MemoirEntry> = memoirs
-        .into_iter()
-        .map(|m| {
-            let ms = store.memoir_stats(&m.id);
-            let (concepts, links) = ms
-                .map(|s| (s.total_concepts, s.total_links))
-                .unwrap_or((0, 0));
-            MemoirEntry {
-                id: m.id,
-                name: m.name,
-                description: m.description,
-                concepts,
-                links,
-            }
-        })
-        .collect();
+        let entries: Vec<MemoirEntry> = memoirs
+            .into_iter()
+            .map(|m| {
+                let ms = store.memoir_stats(&m.id);
+                let (concepts, links) = ms
+                    .map(|s| (s.total_concepts, s.total_links))
+                    .unwrap_or((0, 0));
+                MemoirEntry {
+                    id: m.id,
+                    name: m.name,
+                    description: m.description,
+                    concepts,
+                    links,
+                }
+            })
+            .collect();
 
-    Json(entries).into_response()
+        Json(entries).into_response()
+    })
+    .await
 }
 
 async fn api_memoir_detail(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let store = state.store.lock().unwrap();
-    let memoir = match store.get_memoir(&id) {
-        Ok(Some(m)) => m,
-        Ok(None) => return (StatusCode::NOT_FOUND, "Memoir not found").into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
+    blocking_web(&state, move |store| {
+        let memoir = match store.get_memoir(&id) {
+            Ok(Some(m)) => m,
+            Ok(None) => return (StatusCode::NOT_FOUND, "Memoir not found").into_response(),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
 
-    let concepts = store.list_concepts(&id).unwrap_or_default();
-    let links = store.get_links_for_memoir(&id).unwrap_or_default();
+        let concepts = store.list_concepts(&id).unwrap_or_default();
+        let links = store.get_links_for_memoir(&id).unwrap_or_default();
 
-    Json(serde_json::json!({
-        "memoir": memoir,
-        "concepts": concepts,
-        "links": links,
-    }))
-    .into_response()
+        Json(serde_json::json!({
+            "memoir": memoir,
+            "concepts": concepts,
+            "links": links,
+        }))
+        .into_response()
+    })
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt; // oneshot
+
+    /// PG-backed dashboard state (or None without ICM_POSTGRES_URL). Connects
+    /// on a std::thread (off any runtime), then hands the store to the actor.
+    fn pg_app_state() -> Option<AppState> {
+        std::env::var("ICM_POSTGRES_URL").ok()?;
+        let store = std::thread::spawn(|| {
+            std::env::set_var("ICM_DB_BACKEND", "postgres");
+            let s = Store::with_dims(std::path::Path::new("ignored"), 384);
+            std::env::remove_var("ICM_DB_BACKEND");
+            s
+        })
+        .join()
+        .expect("connect thread")
+        .expect("open pg store");
+        Some(AppState {
+            store: StoreHandle::spawn(store, None).expect("spawn actor"),
+            username: "u".into(),
+            password: "p".into(),
+        })
+    }
+
+    /// F-003c: the dashboard's store endpoints work over Postgres (no
+    /// "runtime within a runtime" panic). Gated on ICM_POSTGRES_URL.
+    #[tokio::test]
+    async fn web_pg_stats_no_runtime_panic() {
+        let Some(state) = pg_app_state() else {
+            return;
+        };
+        // Basic auth for "u:p" == base64 "dTpw".
+        let req = Request::get("/api/stats")
+            .header("authorization", "Basic dTpw")
+            .body(Body::empty())
+            .unwrap();
+        let resp = web_router(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
 }
