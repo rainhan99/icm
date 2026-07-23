@@ -1051,6 +1051,139 @@ fn init_schema(client: &mut Client, requested_dims: usize) -> IcmResult<usize> {
         ))
         .map_err(pg_err)?;
 
+    // F-003a: facts / memoir / feedback / transcript subsystems, mirroring
+    // the SQLite schema (schema.rs). PG-native full-text search uses a
+    // GENERATED `tsvector` column ('simple' config, closest to FTS5's
+    // tokenizer) + GIN index, matching the `memories` table above.
+    //
+    // Every table carries a NULLABLE `tenant` column, left unused by
+    // F-003a (identity resolution + row-level isolation is F-003b). The
+    // existing `memories` table is intentionally NOT altered here — F-003b
+    // owns its tenant column and all RLS.
+    client
+        .batch_execute(
+            "
+            CREATE TABLE IF NOT EXISTS facts (
+                id TEXT PRIMARY KEY,
+                entity TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMPTZ NOT NULL,
+                superseded_at TIMESTAMPTZ,
+                tenant TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_facts_entity ON facts(entity);
+            CREATE INDEX IF NOT EXISTS idx_facts_entity_key ON facts(entity, key);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_active_unique
+                ON facts(entity, key) WHERE superseded_at IS NULL;
+
+            CREATE TABLE IF NOT EXISTS memoirs (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                description TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                consolidation_threshold INTEGER NOT NULL DEFAULT 50,
+                tenant TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS concepts (
+                id TEXT PRIMARY KEY,
+                memoir_id TEXT NOT NULL REFERENCES memoirs(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                definition TEXT NOT NULL,
+                labels TEXT NOT NULL DEFAULT '[]',
+                confidence REAL NOT NULL DEFAULT 0.5,
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                source_memory_ids TEXT NOT NULL DEFAULT '[]',
+                tenant TEXT,
+                fts tsvector GENERATED ALWAYS AS (
+                    to_tsvector('simple',
+                        coalesce(name, '') || ' ' ||
+                        coalesce(definition, '') || ' ' ||
+                        coalesce(labels, ''))
+                ) STORED,
+                UNIQUE (memoir_id, name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_concepts_memoir ON concepts(memoir_id);
+            CREATE INDEX IF NOT EXISTS idx_concepts_name ON concepts(name);
+            CREATE INDEX IF NOT EXISTS idx_concepts_confidence ON concepts(confidence);
+            CREATE INDEX IF NOT EXISTS idx_concepts_fts ON concepts USING GIN (fts);
+
+            CREATE TABLE IF NOT EXISTS concept_links (
+                id TEXT PRIMARY KEY,
+                source_id TEXT NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
+                target_id TEXT NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
+                relation TEXT NOT NULL,
+                weight REAL NOT NULL DEFAULT 1.0,
+                created_at TIMESTAMPTZ NOT NULL,
+                tenant TEXT,
+                UNIQUE (source_id, target_id, relation),
+                CHECK (source_id != target_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_concept_links_source ON concept_links(source_id);
+            CREATE INDEX IF NOT EXISTS idx_concept_links_target ON concept_links(target_id);
+
+            CREATE TABLE IF NOT EXISTS feedback (
+                id TEXT PRIMARY KEY,
+                topic TEXT NOT NULL,
+                context TEXT NOT NULL,
+                predicted TEXT NOT NULL,
+                corrected TEXT NOT NULL,
+                reason TEXT,
+                source TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMPTZ NOT NULL,
+                applied_count INTEGER NOT NULL DEFAULT 0,
+                tenant TEXT,
+                fts tsvector GENERATED ALWAYS AS (
+                    to_tsvector('simple',
+                        coalesce(topic, '') || ' ' ||
+                        coalesce(context, '') || ' ' ||
+                        coalesce(predicted, '') || ' ' ||
+                        coalesce(corrected, '') || ' ' ||
+                        coalesce(reason, ''))
+                ) STORED
+            );
+            CREATE INDEX IF NOT EXISTS idx_feedback_topic ON feedback(topic);
+            CREATE INDEX IF NOT EXISTS idx_feedback_fts ON feedback USING GIN (fts);
+
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                agent TEXT NOT NULL DEFAULT '',
+                project TEXT,
+                started_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                tenant TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
+            CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at);
+
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                tool_name TEXT,
+                tokens BIGINT,
+                ts TIMESTAMPTZ NOT NULL,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                tenant TEXT,
+                fts tsvector GENERATED ALWAYS AS (
+                    to_tsvector('simple', coalesce(content, ''))
+                ) STORED
+            );
+            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+            CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
+            CREATE INDEX IF NOT EXISTS idx_messages_role ON messages(role);
+            CREATE INDEX IF NOT EXISTS idx_messages_fts ON messages USING GIN (fts);
+            ",
+        )
+        .map_err(pg_err)?;
+
     // A vector index needs a concrete dimension; create it after the
     // table exists. HNSW is available in pgvector >= 0.5 (the images we
     // target ship a newer version).
@@ -1738,5 +1871,100 @@ impl TranscriptStore for PostgresStore {
     }
     fn transcript_stats(&self) -> IcmResult<TranscriptStats> {
         unsupported("transcript.transcript_stats")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Integration tests (F-003a) — gated on ICM_POSTGRES_URL.
+//
+// These skip cleanly when ICM_POSTGRES_URL is unset, so the default
+// `cargo test` is unaffected. Run against a live PG, e.g.:
+//   docker run -d --name icm-pg -e POSTGRES_USER=icm -e POSTGRES_PASSWORD=icm \
+//     -e POSTGRES_DB=icm -p 5432:5432 pgvector/pgvector:pg16
+//   ICM_POSTGRES_URL=postgres://icm:icm@localhost:5432/icm \
+//     cargo test -p icm-store --features postgres
+// ---------------------------------------------------------------------------
+#[cfg(all(test, feature = "postgres"))]
+mod pg_tests {
+    use super::*;
+
+    /// Connect to the PG named by `ICM_POSTGRES_URL`, or return `None` so the
+    /// test skips cleanly when no PG is configured.
+    fn pg() -> Option<PostgresStore> {
+        std::env::var("ICM_POSTGRES_URL").ok()?;
+        Some(PostgresStore::connect(384, false).expect("connect ICM_POSTGRES_URL"))
+    }
+
+    /// Truncate every data table so each test starts empty. Ignores missing
+    /// tables so it is safe even before the schema exists.
+    fn reset(s: &PostgresStore) {
+        let mut c = s.conn().expect("lock");
+        for t in [
+            "messages",
+            "sessions",
+            "concept_links",
+            "concepts",
+            "memoirs",
+            "feedback",
+            "facts",
+            "memories",
+        ] {
+            let _ = c.execute(&format!("TRUNCATE TABLE {t} CASCADE"), &[]);
+        }
+    }
+
+    fn table_exists(s: &PostgresStore, t: &str) -> bool {
+        let mut c = s.conn().expect("lock");
+        c.query_one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)",
+            &[&t],
+        )
+        .expect("query")
+        .get::<_, bool>(0)
+    }
+
+    fn table_columns(s: &PostgresStore, t: &str) -> Vec<String> {
+        let mut c = s.conn().expect("lock");
+        c.query(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = $1",
+            &[&t],
+        )
+        .expect("query")
+        .iter()
+        .map(|r| r.get::<_, String>(0))
+        .collect()
+    }
+
+    #[test]
+    fn pg_schema_has_all_subsystem_tables_and_tenant() {
+        let Some(s) = pg() else {
+            return;
+        };
+        for t in [
+            "memoirs",
+            "concepts",
+            "concept_links",
+            "feedback",
+            "sessions",
+            "messages",
+            "facts",
+        ] {
+            assert!(table_exists(&s, t), "missing table {t}");
+            assert!(
+                table_columns(&s, t).iter().any(|c| c == "tenant"),
+                "{t}.tenant not pre-seeded"
+            );
+        }
+        // Idempotency: a second connect re-runs init_schema as a no-op.
+        assert!(PostgresStore::connect(384, false).is_ok());
+    }
+
+    #[test]
+    fn pg_harness_connects_and_resets() {
+        let Some(s) = pg() else {
+            return;
+        };
+        reset(&s);
+        assert_eq!(s.count().expect("count"), 0);
     }
 }
