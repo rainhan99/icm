@@ -1761,29 +1761,180 @@ impl MemoirStore for PostgresStore {
     }
 }
 
+/// Columns selected for a [`Feedback`], in `row_to_feedback` order.
+const FEEDBACK_COLS: &str =
+    "id, topic, context, predicted, corrected, reason, source, created_at, applied_count";
+
+fn row_to_feedback(row: &postgres::Row) -> IcmResult<Feedback> {
+    let applied: i32 = row.try_get(8).map_err(pg_err)?;
+    Ok(Feedback {
+        id: row.try_get(0).map_err(pg_err)?,
+        topic: row.try_get(1).map_err(pg_err)?,
+        context: row.try_get(2).map_err(pg_err)?,
+        predicted: row.try_get(3).map_err(pg_err)?,
+        corrected: row.try_get(4).map_err(pg_err)?,
+        reason: row.try_get(5).map_err(pg_err)?,
+        source: row.try_get(6).map_err(pg_err)?,
+        created_at: row.try_get(7).map_err(pg_err)?,
+        applied_count: applied as u32,
+    })
+}
+
 impl FeedbackStore for PostgresStore {
-    fn store_feedback(&self, _feedback: Feedback) -> IcmResult<String> {
-        unsupported("feedback.store_feedback")
+    fn store_feedback(&self, feedback: Feedback) -> IcmResult<String> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("store_feedback".into()));
+        }
+        let mut c = self.conn()?;
+        c.execute(
+            "INSERT INTO feedback
+                (id, topic, context, predicted, corrected, reason, source, created_at, applied_count)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            &[
+                &feedback.id,
+                &feedback.topic,
+                &feedback.context,
+                &feedback.predicted,
+                &feedback.corrected,
+                &feedback.reason,
+                &feedback.source,
+                &feedback.created_at,
+                &(feedback.applied_count as i32),
+            ],
+        )
+        .map_err(pg_err)?;
+        Ok(feedback.id)
     }
+
     fn search_feedback(
         &self,
-        _query: &str,
-        _topic: Option<&str>,
-        _limit: usize,
+        query: &str,
+        topic: Option<&str>,
+        limit: usize,
     ) -> IcmResult<Vec<Feedback>> {
-        unsupported("feedback.search_feedback")
+        // Empty query → recency list (mirrors the SQLite FTS fallback).
+        if query.trim().is_empty() {
+            return self.list_feedback(topic, limit);
+        }
+        let mut c = self.conn()?;
+        let lim = limit as i64;
+        // Filter by tsvector match, order by recency (parity with SQLite).
+        let rows = match topic {
+            Some(t) => c
+                .query(
+                    &format!(
+                        "SELECT {FEEDBACK_COLS} FROM feedback
+                         WHERE fts @@ plainto_tsquery('simple', $1) AND topic = $2
+                         ORDER BY created_at DESC LIMIT $3"
+                    ),
+                    &[&query, &t, &lim],
+                )
+                .map_err(pg_err)?,
+            None => c
+                .query(
+                    &format!(
+                        "SELECT {FEEDBACK_COLS} FROM feedback
+                         WHERE fts @@ plainto_tsquery('simple', $1)
+                         ORDER BY created_at DESC LIMIT $2"
+                    ),
+                    &[&query, &lim],
+                )
+                .map_err(pg_err)?,
+        };
+        rows.iter().map(row_to_feedback).collect()
     }
-    fn list_feedback(&self, _topic: Option<&str>, _limit: usize) -> IcmResult<Vec<Feedback>> {
-        unsupported("feedback.list_feedback")
+
+    fn list_feedback(&self, topic: Option<&str>, limit: usize) -> IcmResult<Vec<Feedback>> {
+        let mut c = self.conn()?;
+        let lim = limit as i64;
+        let rows = match topic {
+            Some(t) => c
+                .query(
+                    &format!(
+                        "SELECT {FEEDBACK_COLS} FROM feedback
+                         WHERE topic = $1 ORDER BY created_at DESC LIMIT $2"
+                    ),
+                    &[&t, &lim],
+                )
+                .map_err(pg_err)?,
+            None => c
+                .query(
+                    &format!("SELECT {FEEDBACK_COLS} FROM feedback ORDER BY created_at DESC LIMIT $1"),
+                    &[&lim],
+                )
+                .map_err(pg_err)?,
+        };
+        rows.iter().map(row_to_feedback).collect()
     }
-    fn increment_applied(&self, _id: &str) -> IcmResult<()> {
-        unsupported("feedback.increment_applied")
+
+    fn increment_applied(&self, id: &str) -> IcmResult<()> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("increment_applied".into()));
+        }
+        let mut c = self.conn()?;
+        let changed = c
+            .execute(
+                "UPDATE feedback SET applied_count = applied_count + 1 WHERE id = $1",
+                &[&id],
+            )
+            .map_err(pg_err)?;
+        if changed == 0 {
+            return Err(IcmError::NotFound(id.to_string()));
+        }
+        Ok(())
     }
-    fn delete_feedback(&self, _id: &str) -> IcmResult<()> {
-        unsupported("feedback.delete_feedback")
+
+    fn delete_feedback(&self, id: &str) -> IcmResult<()> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("delete_feedback".into()));
+        }
+        let mut c = self.conn()?;
+        let changed = c
+            .execute("DELETE FROM feedback WHERE id = $1", &[&id])
+            .map_err(pg_err)?;
+        if changed == 0 {
+            return Err(IcmError::NotFound(id.to_string()));
+        }
+        Ok(())
     }
+
     fn feedback_stats(&self) -> IcmResult<FeedbackStats> {
-        unsupported("feedback.feedback_stats")
+        let mut c = self.conn()?;
+        let total: i64 = c
+            .query_one("SELECT COUNT(*) FROM feedback", &[])
+            .map_err(pg_err)?
+            .try_get(0)
+            .map_err(pg_err)?;
+        let by_topic_rows = c
+            .query(
+                "SELECT topic, COUNT(*) AS cnt FROM feedback GROUP BY topic ORDER BY cnt DESC",
+                &[],
+            )
+            .map_err(pg_err)?;
+        let mut by_topic = Vec::with_capacity(by_topic_rows.len());
+        for row in &by_topic_rows {
+            let topic: String = row.try_get(0).map_err(pg_err)?;
+            let cnt: i64 = row.try_get(1).map_err(pg_err)?;
+            by_topic.push((topic, cnt as usize));
+        }
+        let ma_rows = c
+            .query(
+                "SELECT id, applied_count FROM feedback
+                 WHERE applied_count > 0 ORDER BY applied_count DESC LIMIT 10",
+                &[],
+            )
+            .map_err(pg_err)?;
+        let mut most_applied = Vec::with_capacity(ma_rows.len());
+        for row in &ma_rows {
+            let id: String = row.try_get(0).map_err(pg_err)?;
+            let n: i32 = row.try_get(1).map_err(pg_err)?;
+            most_applied.push((id, n as u32));
+        }
+        Ok(FeedbackStats {
+            total: total as usize,
+            by_topic,
+            most_applied,
+        })
     }
 }
 
@@ -2152,5 +2303,38 @@ mod pg_tests {
         // forget removes active + history for the slot.
         assert_eq!(s.forget_fact("user", "editor").unwrap(), 2);
         assert!(s.get_fact("user", "editor").unwrap().is_none());
+    }
+
+    #[test]
+    fn pg_feedback_search_and_apply() {
+        let Some(s) = pg() else {
+            return;
+        };
+        reset(&s);
+        let id = s
+            .store_feedback(Feedback::new(
+                "routing".into(),
+                "ctx".into(),
+                "predicted X".into(),
+                "use Y instead".into(),
+                Some("reason".into()),
+                "test".into(),
+            ))
+            .unwrap();
+        // tsvector full-text search finds the row by a content word.
+        let hits = s.search_feedback("instead", None, 10).unwrap();
+        assert!(hits.iter().any(|f| f.id == id));
+        // topic filter + empty-query fallback to list.
+        assert_eq!(s.list_feedback(Some("routing"), 10).unwrap().len(), 1);
+        assert_eq!(s.search_feedback("   ", None, 10).unwrap().len(), 1);
+        assert!(s.search_feedback("instead", Some("other"), 10).unwrap().is_empty());
+        // applied counter + stats.
+        s.increment_applied(&id).unwrap();
+        let st = s.feedback_stats().unwrap();
+        assert_eq!(st.total, 1);
+        assert!(st.most_applied.iter().any(|(fid, n)| *fid == id && *n == 1));
+        // delete.
+        s.delete_feedback(&id).unwrap();
+        assert!(s.list_feedback(None, 10).unwrap().is_empty());
     }
 }
