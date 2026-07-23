@@ -1226,6 +1226,36 @@ fn init_schema(client: &mut Client, requested_dims: usize) -> IcmResult<usize> {
         )
         .map_err(pg_err)?;
 
+    // F-003b: tenant column + auto-tag defaults + legacy backfill.
+    // `memories` was excluded by F-003a — add it here. All eight
+    // tenant-scoped tables get DEFAULT current_setting('app.tenant', true)
+    // so a write auto-tags with the connection's tenant (NULL when unset =
+    // unrestricted). Backfill legacy NULL-tenant rows to 'default' — run
+    // BEFORE the RLS FORCE below so it is never blocked by a policy.
+    // Idempotent: ADD COLUMN IF NOT EXISTS, re-runnable ALTER, no-op UPDATE.
+    client
+        .batch_execute(
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS tenant TEXT;
+             ALTER TABLE memories      ALTER COLUMN tenant SET DEFAULT current_setting('app.tenant', true);
+             ALTER TABLE facts         ALTER COLUMN tenant SET DEFAULT current_setting('app.tenant', true);
+             ALTER TABLE memoirs       ALTER COLUMN tenant SET DEFAULT current_setting('app.tenant', true);
+             ALTER TABLE concepts      ALTER COLUMN tenant SET DEFAULT current_setting('app.tenant', true);
+             ALTER TABLE concept_links ALTER COLUMN tenant SET DEFAULT current_setting('app.tenant', true);
+             ALTER TABLE feedback      ALTER COLUMN tenant SET DEFAULT current_setting('app.tenant', true);
+             ALTER TABLE sessions      ALTER COLUMN tenant SET DEFAULT current_setting('app.tenant', true);
+             ALTER TABLE messages      ALTER COLUMN tenant SET DEFAULT current_setting('app.tenant', true);
+
+             UPDATE memories      SET tenant = 'default' WHERE tenant IS NULL;
+             UPDATE facts         SET tenant = 'default' WHERE tenant IS NULL;
+             UPDATE memoirs       SET tenant = 'default' WHERE tenant IS NULL;
+             UPDATE concepts      SET tenant = 'default' WHERE tenant IS NULL;
+             UPDATE concept_links SET tenant = 'default' WHERE tenant IS NULL;
+             UPDATE feedback      SET tenant = 'default' WHERE tenant IS NULL;
+             UPDATE sessions      SET tenant = 'default' WHERE tenant IS NULL;
+             UPDATE messages      SET tenant = 'default' WHERE tenant IS NULL;",
+        )
+        .map_err(pg_err)?;
+
     Ok(dims)
 }
 
@@ -3382,6 +3412,37 @@ mod pg_tests {
         s.set_tenant(Some("x'; DROP TABLE memories;--")).unwrap();
         assert!(s.count().is_ok(), "memories table survives");
         assert_eq!(current_setting(&s), "x'; DROP TABLE memories;--");
+        s.set_tenant(None).unwrap();
+    }
+
+    /// Read the `tenant` column of a single row (bypasses nothing — used to
+    /// prove auto-tagging; safe to call under any tenant that can see it).
+    fn tenant_of_row(s: &PostgresStore, table: &str, id: &str) -> String {
+        let mut c = s.conn().expect("lock");
+        c.query_one(&format!("SELECT tenant FROM {table} WHERE id = $1"), &[&id])
+            .expect("query")
+            .try_get::<_, Option<String>>(0)
+            .expect("get")
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn rls_schema_and_autotag() {
+        let Some(s) = pg() else {
+            return;
+        };
+        reset(&s);
+        // memories gained a tenant column (F-003a only did the other 7).
+        assert!(
+            table_columns(&s, "memories").iter().any(|c| c == "tenant"),
+            "memories.tenant added"
+        );
+        // A write under a set tenant auto-tags via the column DEFAULT.
+        s.set_tenant(Some("acme")).unwrap();
+        let id = s
+            .store(Memory::new("t".into(), "hi".into(), Importance::High))
+            .unwrap();
+        assert_eq!(tenant_of_row(&s, "memories", &id), "acme");
         s.set_tenant(None).unwrap();
     }
 }
