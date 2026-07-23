@@ -16,8 +16,11 @@ services.
 
 ## What it covers
 
-This first cut implements the **core memory surface** — exactly the part
-that benefits from being shared:
+As of **F-003a**, the PostgreSQL backend is a **complete replacement for
+SQLite across all subsystems** — a central Postgres node serves the full
+feature set, not just core memory.
+
+**Core memory:**
 
 - `store` (with dedup + metadata merge), `get`, `update`, `forget`
 - keyword search, full-text search (PostgreSQL `tsvector` + GIN),
@@ -29,10 +32,26 @@ that benefits from being shared:
   hook telemetry, the async extraction queue, code areas, and the
   key/value metadata.
 
-The heavier subsystems — memoir graph, verbatim transcripts, structured
-facts, feedback, and pattern mining — return a clear
-`operation not supported on this storage backend` error on PostgreSQL for
-now. They remain fully available on the default SQLite backend.
+**All other subsystems (F-003a):**
+
+- **facts** — versioned `(entity, key, value)` with supersession history
+- **memoir** — memoirs, concepts, concept links, graph traversal
+  (`get_neighbors`, depth-bounded `get_neighborhood`), cycle rejection
+- **feedback** — store + `tsvector` full-text search
+- **transcripts** — sessions + messages, verbatim replay, `tsvector` search
+
+Full-text search on these uses the same PostgreSQL `tsvector('simple')`
+GENERATED columns + GIN indexes as core memory. `ts_rank`/recency ordering
+differs slightly from SQLite's FTS5 `bm25`, but hit membership matches.
+
+> ### ⚠️ Multi-tenancy: not yet
+>
+> Every new subsystem table carries a **nullable `tenant` column that
+> F-003a leaves unused** — it is scaffolding for F-003b. A Postgres node
+> today still serves **one shared dataset** (exactly like SQLite): there is
+> **no tenant data isolation**. Row-level tenant filtering + PostgreSQL
+> Row-Level Security are **F-003b**. Do not treat a shared Postgres node as
+> a boundary between mutually distrusting tenants until then.
 
 ## Requirements
 
@@ -82,8 +101,12 @@ icm store -t demo -c "PostgreSQL backend shares memory across replicas" -i high
 icm recall "shared memory"
 icm stats
 
-# Integration tests (skipped automatically when the env var is unset):
-cargo test -p icm-store --no-default-features --features postgres -- --test-threads=1
+# Integration tests — one round-trip per subsystem (facts, memoir, feedback,
+# transcript) plus schema/harness. They read ICM_POSTGRES_URL and SKIP
+# automatically when it is unset, so the default `cargo test` is unaffected.
+# Run single-threaded: the tests share one database and truncate between runs.
+ICM_POSTGRES_URL="postgres://icm:icm@127.0.0.1:55432/icm" \
+  cargo test -p icm-store --features postgres pg_ -- --test-threads=1
 ```
 
 ## Kubernetes
