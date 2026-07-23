@@ -1660,39 +1660,217 @@ fn unsupported<T>(op: &str) -> IcmResult<T> {
     )))
 }
 
+const MEMOIR_COLS: &str = "id, name, description, created_at, updated_at, consolidation_threshold";
+const CONCEPT_COLS: &str = "id, memoir_id, name, definition, labels, confidence, \
+                            revision, created_at, updated_at, source_memory_ids";
+
+fn row_to_memoir(row: &postgres::Row) -> IcmResult<Memoir> {
+    let threshold: i32 = row.try_get(5).map_err(pg_err)?;
+    Ok(Memoir {
+        id: row.try_get(0).map_err(pg_err)?,
+        name: row.try_get(1).map_err(pg_err)?,
+        description: row.try_get(2).map_err(pg_err)?,
+        created_at: row.try_get(3).map_err(pg_err)?,
+        updated_at: row.try_get(4).map_err(pg_err)?,
+        consolidation_threshold: threshold as u32,
+    })
+}
+
+fn row_to_concept(row: &postgres::Row) -> IcmResult<Concept> {
+    let labels_json: String = row.try_get(4).map_err(pg_err)?;
+    let revision: i32 = row.try_get(6).map_err(pg_err)?;
+    let source_ids_json: String = row.try_get(9).map_err(pg_err)?;
+    Ok(Concept {
+        id: row.try_get(0).map_err(pg_err)?,
+        memoir_id: row.try_get(1).map_err(pg_err)?,
+        name: row.try_get(2).map_err(pg_err)?,
+        definition: row.try_get(3).map_err(pg_err)?,
+        labels: serde_json::from_str(&labels_json).unwrap_or_default(),
+        confidence: row.try_get(5).map_err(pg_err)?,
+        revision: revision as u32,
+        created_at: row.try_get(7).map_err(pg_err)?,
+        updated_at: row.try_get(8).map_err(pg_err)?,
+        source_memory_ids: serde_json::from_str(&source_ids_json).unwrap_or_default(),
+    })
+}
+
 impl MemoirStore for PostgresStore {
-    fn create_memoir(&self, _memoir: Memoir) -> IcmResult<String> {
-        unsupported("memoir.create_memoir")
+    fn create_memoir(&self, memoir: Memoir) -> IcmResult<String> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("create_memoir".into()));
+        }
+        let mut c = self.conn()?;
+        c.execute(
+            "INSERT INTO memoirs (id, name, description, created_at, updated_at, consolidation_threshold)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            &[
+                &memoir.id,
+                &memoir.name,
+                &memoir.description,
+                &memoir.created_at,
+                &memoir.updated_at,
+                &(memoir.consolidation_threshold as i32),
+            ],
+        )
+        .map_err(pg_err)?;
+        Ok(memoir.id)
     }
-    fn get_memoir(&self, _id: &str) -> IcmResult<Option<Memoir>> {
-        unsupported("memoir.get_memoir")
+    fn get_memoir(&self, id: &str) -> IcmResult<Option<Memoir>> {
+        let mut c = self.conn()?;
+        let row = c
+            .query_opt(
+                &format!("SELECT {MEMOIR_COLS} FROM memoirs WHERE id = $1"),
+                &[&id],
+            )
+            .map_err(pg_err)?;
+        row.as_ref().map(row_to_memoir).transpose()
     }
-    fn get_memoir_by_name(&self, _name: &str) -> IcmResult<Option<Memoir>> {
-        unsupported("memoir.get_memoir_by_name")
+    fn get_memoir_by_name(&self, name: &str) -> IcmResult<Option<Memoir>> {
+        let mut c = self.conn()?;
+        let row = c
+            .query_opt(
+                &format!("SELECT {MEMOIR_COLS} FROM memoirs WHERE name = $1"),
+                &[&name],
+            )
+            .map_err(pg_err)?;
+        row.as_ref().map(row_to_memoir).transpose()
     }
-    fn update_memoir(&self, _memoir: &Memoir) -> IcmResult<()> {
-        unsupported("memoir.update_memoir")
+    fn update_memoir(&self, memoir: &Memoir) -> IcmResult<()> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("update_memoir".into()));
+        }
+        let mut c = self.conn()?;
+        let changed = c
+            .execute(
+                "UPDATE memoirs SET name = $2, description = $3, updated_at = $4,
+                 consolidation_threshold = $5 WHERE id = $1",
+                &[
+                    &memoir.id,
+                    &memoir.name,
+                    &memoir.description,
+                    &memoir.updated_at,
+                    &(memoir.consolidation_threshold as i32),
+                ],
+            )
+            .map_err(pg_err)?;
+        if changed == 0 {
+            return Err(IcmError::NotFound(memoir.id.clone()));
+        }
+        Ok(())
     }
-    fn delete_memoir(&self, _id: &str) -> IcmResult<()> {
-        unsupported("memoir.delete_memoir")
+    fn delete_memoir(&self, id: &str) -> IcmResult<()> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("delete_memoir".into()));
+        }
+        let mut c = self.conn()?;
+        let changed = c
+            .execute("DELETE FROM memoirs WHERE id = $1", &[&id])
+            .map_err(pg_err)?;
+        if changed == 0 {
+            return Err(IcmError::NotFound(id.to_string()));
+        }
+        Ok(())
     }
     fn list_memoirs(&self) -> IcmResult<Vec<Memoir>> {
-        unsupported("memoir.list_memoirs")
+        let mut c = self.conn()?;
+        let rows = c
+            .query(
+                &format!("SELECT {MEMOIR_COLS} FROM memoirs ORDER BY name LIMIT 500"),
+                &[],
+            )
+            .map_err(pg_err)?;
+        rows.iter().map(row_to_memoir).collect()
     }
-    fn add_concept(&self, _concept: Concept) -> IcmResult<String> {
-        unsupported("memoir.add_concept")
+    fn add_concept(&self, concept: Concept) -> IcmResult<String> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("add_concept".into()));
+        }
+        let labels_json = serde_json::to_string(&concept.labels)?;
+        let source_ids_json = serde_json::to_string(&concept.source_memory_ids)?;
+        let mut c = self.conn()?;
+        c.execute(
+            "INSERT INTO concepts
+                (id, memoir_id, name, definition, labels, confidence, revision,
+                 created_at, updated_at, source_memory_ids)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            &[
+                &concept.id,
+                &concept.memoir_id,
+                &concept.name,
+                &concept.definition,
+                &labels_json,
+                &concept.confidence,
+                &(concept.revision as i32),
+                &concept.created_at,
+                &concept.updated_at,
+                &source_ids_json,
+            ],
+        )
+        .map_err(pg_err)?;
+        Ok(concept.id)
     }
-    fn get_concept(&self, _id: &str) -> IcmResult<Option<Concept>> {
-        unsupported("memoir.get_concept")
+    fn get_concept(&self, id: &str) -> IcmResult<Option<Concept>> {
+        let mut c = self.conn()?;
+        let row = c
+            .query_opt(
+                &format!("SELECT {CONCEPT_COLS} FROM concepts WHERE id = $1"),
+                &[&id],
+            )
+            .map_err(pg_err)?;
+        row.as_ref().map(row_to_concept).transpose()
     }
-    fn get_concept_by_name(&self, _memoir_id: &str, _name: &str) -> IcmResult<Option<Concept>> {
-        unsupported("memoir.get_concept_by_name")
+    fn get_concept_by_name(&self, memoir_id: &str, name: &str) -> IcmResult<Option<Concept>> {
+        let mut c = self.conn()?;
+        let row = c
+            .query_opt(
+                &format!("SELECT {CONCEPT_COLS} FROM concepts WHERE memoir_id = $1 AND name = $2"),
+                &[&memoir_id, &name],
+            )
+            .map_err(pg_err)?;
+        row.as_ref().map(row_to_concept).transpose()
     }
-    fn update_concept(&self, _concept: &Concept) -> IcmResult<()> {
-        unsupported("memoir.update_concept")
+    fn update_concept(&self, concept: &Concept) -> IcmResult<()> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("update_concept".into()));
+        }
+        let labels_json = serde_json::to_string(&concept.labels)?;
+        let source_ids_json = serde_json::to_string(&concept.source_memory_ids)?;
+        let mut c = self.conn()?;
+        let changed = c
+            .execute(
+                "UPDATE concepts SET memoir_id = $2, name = $3, definition = $4, labels = $5,
+                 confidence = $6, revision = $7, updated_at = $8, source_memory_ids = $9
+                 WHERE id = $1",
+                &[
+                    &concept.id,
+                    &concept.memoir_id,
+                    &concept.name,
+                    &concept.definition,
+                    &labels_json,
+                    &concept.confidence,
+                    &(concept.revision as i32),
+                    &concept.updated_at,
+                    &source_ids_json,
+                ],
+            )
+            .map_err(pg_err)?;
+        if changed == 0 {
+            return Err(IcmError::NotFound(concept.id.clone()));
+        }
+        Ok(())
     }
-    fn delete_concept(&self, _id: &str) -> IcmResult<()> {
-        unsupported("memoir.delete_concept")
+    fn delete_concept(&self, id: &str) -> IcmResult<()> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("delete_concept".into()));
+        }
+        let mut c = self.conn()?;
+        let changed = c
+            .execute("DELETE FROM concepts WHERE id = $1", &[&id])
+            .map_err(pg_err)?;
+        if changed == 0 {
+            return Err(IcmError::NotFound(id.to_string()));
+        }
+        Ok(())
     }
     fn list_concepts(&self, _memoir_id: &str) -> IcmResult<Vec<Concept>> {
         unsupported("memoir.list_concepts")
@@ -2668,5 +2846,44 @@ mod pg_tests {
         s.forget_session(&sid).unwrap();
         assert!(s.get_session(&sid).unwrap().is_none());
         assert_eq!(s.list_session_messages(&sid, 100, 0).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn pg_memoir_and_concept_crud() {
+        let Some(s) = pg() else {
+            return;
+        };
+        reset(&s);
+        let mid = s
+            .create_memoir(Memoir::new("arch".into(), "desc".into()))
+            .unwrap();
+        assert_eq!(s.get_memoir_by_name("arch").unwrap().unwrap().id, mid);
+        assert_eq!(s.get_memoir(&mid).unwrap().unwrap().name, "arch");
+
+        let cid = s
+            .add_concept(Concept::new(
+                mid.clone(),
+                "store enum".into(),
+                "runtime backend dispatch".into(),
+            ))
+            .unwrap();
+        assert_eq!(
+            s.get_concept_by_name(&mid, "store enum").unwrap().unwrap().id,
+            cid
+        );
+
+        // update round-trips confidence + JSON labels.
+        let mut c = s.get_concept(&cid).unwrap().unwrap();
+        c.confidence = 0.9;
+        c.labels = vec![Label::new("tag", "core")];
+        s.update_concept(&c).unwrap();
+        let got = s.get_concept(&cid).unwrap().unwrap();
+        assert_eq!(got.confidence, 0.9);
+        assert_eq!(got.labels, vec![Label::new("tag", "core")]);
+
+        s.delete_concept(&cid).unwrap();
+        assert!(s.get_concept(&cid).unwrap().is_none());
+        s.delete_memoir(&mid).unwrap();
+        assert!(s.list_memoirs().unwrap().is_empty());
     }
 }
