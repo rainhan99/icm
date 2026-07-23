@@ -18,6 +18,10 @@ mod learn_tests;
 mod recall_format;
 #[cfg(feature = "remote-store")]
 mod rpc_dispatch;
+/// F-003c: dedicated store-owning thread so the blocking store client can be
+/// driven from the async HTTP/web servers (see the module docs).
+#[cfg(any(feature = "http-api", feature = "web"))]
+mod store_actor;
 mod summarizer;
 #[cfg(feature = "tui")]
 mod tui;
