@@ -1872,35 +1872,120 @@ impl MemoirStore for PostgresStore {
         }
         Ok(())
     }
-    fn list_concepts(&self, _memoir_id: &str) -> IcmResult<Vec<Concept>> {
-        unsupported("memoir.list_concepts")
+    fn list_concepts(&self, memoir_id: &str) -> IcmResult<Vec<Concept>> {
+        let mut c = self.conn()?;
+        let rows = c
+            .query(
+                &format!(
+                    "SELECT {CONCEPT_COLS} FROM concepts
+                     WHERE memoir_id = $1 ORDER BY name LIMIT 1000"
+                ),
+                &[&memoir_id],
+            )
+            .map_err(pg_err)?;
+        rows.iter().map(row_to_concept).collect()
     }
     fn search_concepts_fts(
         &self,
-        _memoir_id: &str,
-        _query: &str,
-        _limit: usize,
+        memoir_id: &str,
+        query: &str,
+        limit: usize,
     ) -> IcmResult<Vec<Concept>> {
-        unsupported("memoir.search_concepts_fts")
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut c = self.conn()?;
+        let lim = limit as i64;
+        let rows = c
+            .query(
+                &format!(
+                    "SELECT {CONCEPT_COLS} FROM concepts
+                     WHERE memoir_id = $1 AND fts @@ plainto_tsquery('simple', $2)
+                     ORDER BY confidence DESC LIMIT $3"
+                ),
+                &[&memoir_id, &query, &lim],
+            )
+            .map_err(pg_err)?;
+        rows.iter().map(row_to_concept).collect()
     }
     fn search_concepts_by_label(
         &self,
-        _memoir_id: &str,
-        _label: &Label,
-        _limit: usize,
+        memoir_id: &str,
+        label: &Label,
+        limit: usize,
     ) -> IcmResult<Vec<Concept>> {
-        unsupported("memoir.search_concepts_by_label")
+        // Match the serialized JSON labels column (parity with SQLite).
+        let pattern = format!(
+            "%\"namespace\":\"{}\"%\"value\":\"{}\"%",
+            label.namespace, label.value
+        );
+        let mut c = self.conn()?;
+        let lim = limit as i64;
+        let rows = c
+            .query(
+                &format!(
+                    "SELECT {CONCEPT_COLS} FROM concepts
+                     WHERE memoir_id = $1 AND labels LIKE $2
+                     ORDER BY confidence DESC LIMIT $3"
+                ),
+                &[&memoir_id, &pattern, &lim],
+            )
+            .map_err(pg_err)?;
+        rows.iter().map(row_to_concept).collect()
     }
-    fn search_all_concepts_fts(&self, _query: &str, _limit: usize) -> IcmResult<Vec<Concept>> {
-        unsupported("memoir.search_all_concepts_fts")
+    fn search_all_concepts_fts(&self, query: &str, limit: usize) -> IcmResult<Vec<Concept>> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut c = self.conn()?;
+        let lim = limit as i64;
+        let rows = c
+            .query(
+                &format!(
+                    "SELECT {CONCEPT_COLS} FROM concepts
+                     WHERE fts @@ plainto_tsquery('simple', $1)
+                     ORDER BY confidence DESC LIMIT $2"
+                ),
+                &[&query, &lim],
+            )
+            .map_err(pg_err)?;
+        rows.iter().map(row_to_concept).collect()
     }
     fn refine_concept(
         &self,
-        _id: &str,
-        _new_definition: &str,
-        _new_source_ids: &[String],
+        id: &str,
+        new_definition: &str,
+        new_source_ids: &[String],
     ) -> IcmResult<()> {
-        unsupported("memoir.refine_concept")
+        if self.readonly {
+            return Err(IcmError::ReadOnly("refine_concept".into()));
+        }
+        let concept = self
+            .get_concept(id)?
+            .ok_or_else(|| IcmError::NotFound(id.to_string()))?;
+        let mut merged = concept.source_memory_ids;
+        for sid in new_source_ids {
+            if !merged.contains(sid) {
+                merged.push(sid.clone());
+            }
+        }
+        let source_ids_json = serde_json::to_string(&merged)?;
+        let new_confidence = (concept.confidence + 0.1).min(1.0);
+        let mut c = self.conn()?;
+        c.execute(
+            "UPDATE concepts SET definition = $2, revision = revision + 1,
+             confidence = $3, updated_at = $4, source_memory_ids = $5
+             WHERE id = $1",
+            &[
+                &id,
+                &new_definition,
+                &new_confidence,
+                &Utc::now(),
+                &source_ids_json,
+            ],
+        )
+        .map_err(pg_err)?;
+        Ok(())
     }
     fn add_link(&self, _link: ConceptLink) -> IcmResult<String> {
         unsupported("memoir.add_link")
@@ -2885,5 +2970,52 @@ mod pg_tests {
         assert!(s.get_concept(&cid).unwrap().is_none());
         s.delete_memoir(&mid).unwrap();
         assert!(s.list_memoirs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pg_memoir_search_and_refine() {
+        let Some(s) = pg() else {
+            return;
+        };
+        reset(&s);
+        let mid = s
+            .create_memoir(Memoir::new("arch".into(), "d".into()))
+            .unwrap();
+        let mut concept = Concept::new(
+            mid.clone(),
+            "routing".into(),
+            "dispatch via store enum".into(),
+        );
+        concept.labels = vec![Label::new("layer", "core")];
+        let cid = s.add_concept(concept).unwrap();
+
+        assert_eq!(s.list_concepts(&mid).unwrap().len(), 1);
+        // tsvector concept search, scoped + cross-memoir.
+        assert!(s
+            .search_concepts_fts(&mid, "dispatch", 10)
+            .unwrap()
+            .iter()
+            .any(|c| c.id == cid));
+        assert!(s
+            .search_all_concepts_fts("dispatch", 10)
+            .unwrap()
+            .iter()
+            .any(|c| c.id == cid));
+        assert!(s.search_concepts_fts(&mid, "   ", 10).unwrap().is_empty());
+        // label search over the JSON labels column.
+        assert!(s
+            .search_concepts_by_label(&mid, &Label::new("layer", "core"), 10)
+            .unwrap()
+            .iter()
+            .any(|c| c.id == cid));
+        // refine merges sources, bumps revision + confidence.
+        let before = s.get_concept(&cid).unwrap().unwrap();
+        s.refine_concept(&cid, "dispatch via runtime store enum", &["m1".to_string()])
+            .unwrap();
+        let after = s.get_concept(&cid).unwrap().unwrap();
+        assert_eq!(after.revision, before.revision + 1);
+        assert!(after.confidence > before.confidence);
+        assert!(after.source_memory_ids.contains(&"m1".to_string()));
+        assert_eq!(after.definition, "dispatch via runtime store enum");
     }
 }
