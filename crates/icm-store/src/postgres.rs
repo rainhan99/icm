@@ -345,6 +345,24 @@ impl PostgresStore {
         self.client.lock().map_err(|_| lock_err())
     }
 
+    /// Set the RLS tenant GUC (`app.tenant`) for subsequent queries on this
+    /// connection (F-003b). **Injection-safe**: the tenant is a bound
+    /// parameter to `set_config`, never string-interpolated into `SET`.
+    /// `None` clears it to `''` → the RLS policy treats it as unrestricted
+    /// (today's single-dataset behavior). Session-scoped on the shared
+    /// connection, so the caller must hold the store lock across this call
+    /// and the following query (a future connection pool would need
+    /// `SET LOCAL` inside a transaction instead).
+    pub fn set_tenant(&self, tenant: Option<&str>) -> IcmResult<()> {
+        let mut c = self.conn()?;
+        c.execute(
+            "SELECT set_config('app.tenant', $1, false)",
+            &[&tenant.unwrap_or("")],
+        )
+        .map_err(pg_err)?;
+        Ok(())
+    }
+
     /// Resolve the connection string from the environment.
     fn conn_string() -> IcmResult<String> {
         std::env::var("ICM_POSTGRES_URL")
@@ -3339,5 +3357,31 @@ mod pg_tests {
         let l = s.get_links_from(&a).unwrap().pop().unwrap();
         s.delete_link(&l.id).unwrap();
         assert_eq!(s.get_links_from(&a).unwrap().len(), 0);
+    }
+
+    /// Read the connection's current `app.tenant` GUC ("" when unset).
+    fn current_setting(s: &PostgresStore) -> String {
+        let mut c = s.conn().expect("lock");
+        c.query_one("SELECT current_setting('app.tenant', true)", &[])
+            .expect("query")
+            .try_get::<_, Option<String>>(0)
+            .expect("get")
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn rls_set_tenant_roundtrip() {
+        let Some(s) = pg() else {
+            return;
+        };
+        s.set_tenant(Some("tenant-x")).unwrap();
+        assert_eq!(current_setting(&s), "tenant-x");
+        s.set_tenant(None).unwrap();
+        assert_eq!(current_setting(&s), "");
+        // An injection attempt is inert — treated as a literal tenant name.
+        s.set_tenant(Some("x'; DROP TABLE memories;--")).unwrap();
+        assert!(s.count().is_ok(), "memories table survives");
+        assert_eq!(current_setting(&s), "x'; DROP TABLE memories;--");
+        s.set_tenant(None).unwrap();
     }
 }

@@ -352,6 +352,33 @@ impl Store {
         dispatch!(self, is_readonly())
     }
 
+    /// Set the tenant for subsequent operations on this store (F-003b).
+    ///
+    /// Only the Postgres backend enforces tenant isolation (via RLS +
+    /// `set_config('app.tenant', …)`); every other backend — SQLite,
+    /// OpenSearch, and the Remote thin client — is a **no-op** (SQLite has
+    /// no RLS; the Remote client forwards its token and the central node
+    /// resolves the tenant). `None` clears the tenant → unrestricted.
+    ///
+    /// Callers MUST keep this store locked across `set_tenant` **and** the
+    /// following query, so a concurrent request cannot change the tenant in
+    /// between (the session GUC lives on the shared connection).
+    // `tenant` is only read by the Postgres arm; unused when that backend
+    // feature is off (e.g. the default SQLite-only build).
+    #[cfg_attr(not(feature = "postgres"), allow(unused_variables))]
+    pub fn set_tenant(&self, tenant: Option<&str>) -> IcmResult<()> {
+        match self {
+            #[cfg(feature = "backend-sqlite")]
+            Store::Sqlite(_) => Ok(()),
+            #[cfg(feature = "postgres")]
+            Store::Postgres(s) => s.set_tenant(tenant),
+            #[cfg(feature = "opensearch")]
+            Store::OpenSearch(_) => Ok(()),
+            #[cfg(feature = "remote-store")]
+            Store::Remote(_) => Ok(()),
+        }
+    }
+
     // --- Inherent store/recall/hook surface (forwarded) ---
 
     pub fn maybe_auto_decay(&self) -> IcmResult<()> {
