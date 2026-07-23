@@ -24,15 +24,21 @@
 //!   `DATABASE_URL` as a fallback). The `&Path` arguments that the CLI
 //!   passes for the SQLite file are ignored.
 //!
-//! Scope of this first cut: the full [`MemoryStore`] surface (the core
-//! shared-memory use case behind #301) plus the ancillary tables used by
-//! the normal store/recall/hook path (hook telemetry, the extraction
-//! queue, code areas, the key/value metadata). The heavier subsystems
-//! (memoir graph, transcripts, structured facts, feedback, pattern
-//! mining) return [`IcmError::Unsupported`] on this backend for now;
-//! they remain fully available on the default SQLite backend.
+//! Scope: full parity with the SQLite backend across the [`MemoryStore`],
+//! [`FactsStore`], [`MemoirStore`], [`FeedbackStore`], and
+//! [`TranscriptStore`] surfaces (F-003a), plus the ancillary tables used by
+//! the normal store/recall/hook path (hook telemetry, the extraction queue,
+//! code areas, the key/value metadata). Only **pattern mining**
+//! (`detect_patterns` / `extract_pattern_as_concept`) still returns
+//! [`IcmError::Unsupported`] here; it remains available on the default
+//! SQLite backend.
+//!
+//! Multi-tenant note: every F-003a table has a nullable `tenant` column that
+//! is currently unused (scaffolding for F-003b). This backend does NOT
+//! isolate tenant data — a shared node serves one dataset. Isolation
+//! (row-level tenant + RLS) is F-003b.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
@@ -1051,6 +1057,139 @@ fn init_schema(client: &mut Client, requested_dims: usize) -> IcmResult<usize> {
         ))
         .map_err(pg_err)?;
 
+    // F-003a: facts / memoir / feedback / transcript subsystems, mirroring
+    // the SQLite schema (schema.rs). PG-native full-text search uses a
+    // GENERATED `tsvector` column ('simple' config, closest to FTS5's
+    // tokenizer) + GIN index, matching the `memories` table above.
+    //
+    // Every table carries a NULLABLE `tenant` column, left unused by
+    // F-003a (identity resolution + row-level isolation is F-003b). The
+    // existing `memories` table is intentionally NOT altered here — F-003b
+    // owns its tenant column and all RLS.
+    client
+        .batch_execute(
+            "
+            CREATE TABLE IF NOT EXISTS facts (
+                id TEXT PRIMARY KEY,
+                entity TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMPTZ NOT NULL,
+                superseded_at TIMESTAMPTZ,
+                tenant TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_facts_entity ON facts(entity);
+            CREATE INDEX IF NOT EXISTS idx_facts_entity_key ON facts(entity, key);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_active_unique
+                ON facts(entity, key) WHERE superseded_at IS NULL;
+
+            CREATE TABLE IF NOT EXISTS memoirs (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                description TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                consolidation_threshold INTEGER NOT NULL DEFAULT 50,
+                tenant TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS concepts (
+                id TEXT PRIMARY KEY,
+                memoir_id TEXT NOT NULL REFERENCES memoirs(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                definition TEXT NOT NULL,
+                labels TEXT NOT NULL DEFAULT '[]',
+                confidence REAL NOT NULL DEFAULT 0.5,
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                source_memory_ids TEXT NOT NULL DEFAULT '[]',
+                tenant TEXT,
+                fts tsvector GENERATED ALWAYS AS (
+                    to_tsvector('simple',
+                        coalesce(name, '') || ' ' ||
+                        coalesce(definition, '') || ' ' ||
+                        coalesce(labels, ''))
+                ) STORED,
+                UNIQUE (memoir_id, name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_concepts_memoir ON concepts(memoir_id);
+            CREATE INDEX IF NOT EXISTS idx_concepts_name ON concepts(name);
+            CREATE INDEX IF NOT EXISTS idx_concepts_confidence ON concepts(confidence);
+            CREATE INDEX IF NOT EXISTS idx_concepts_fts ON concepts USING GIN (fts);
+
+            CREATE TABLE IF NOT EXISTS concept_links (
+                id TEXT PRIMARY KEY,
+                source_id TEXT NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
+                target_id TEXT NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
+                relation TEXT NOT NULL,
+                weight REAL NOT NULL DEFAULT 1.0,
+                created_at TIMESTAMPTZ NOT NULL,
+                tenant TEXT,
+                UNIQUE (source_id, target_id, relation),
+                CHECK (source_id != target_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_concept_links_source ON concept_links(source_id);
+            CREATE INDEX IF NOT EXISTS idx_concept_links_target ON concept_links(target_id);
+
+            CREATE TABLE IF NOT EXISTS feedback (
+                id TEXT PRIMARY KEY,
+                topic TEXT NOT NULL,
+                context TEXT NOT NULL,
+                predicted TEXT NOT NULL,
+                corrected TEXT NOT NULL,
+                reason TEXT,
+                source TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMPTZ NOT NULL,
+                applied_count INTEGER NOT NULL DEFAULT 0,
+                tenant TEXT,
+                fts tsvector GENERATED ALWAYS AS (
+                    to_tsvector('simple',
+                        coalesce(topic, '') || ' ' ||
+                        coalesce(context, '') || ' ' ||
+                        coalesce(predicted, '') || ' ' ||
+                        coalesce(corrected, '') || ' ' ||
+                        coalesce(reason, ''))
+                ) STORED
+            );
+            CREATE INDEX IF NOT EXISTS idx_feedback_topic ON feedback(topic);
+            CREATE INDEX IF NOT EXISTS idx_feedback_fts ON feedback USING GIN (fts);
+
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                agent TEXT NOT NULL DEFAULT '',
+                project TEXT,
+                started_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                tenant TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
+            CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at);
+
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                tool_name TEXT,
+                tokens BIGINT,
+                ts TIMESTAMPTZ NOT NULL,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                tenant TEXT,
+                fts tsvector GENERATED ALWAYS AS (
+                    to_tsvector('simple', coalesce(content, ''))
+                ) STORED
+            );
+            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+            CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
+            CREATE INDEX IF NOT EXISTS idx_messages_role ON messages(role);
+            CREATE INDEX IF NOT EXISTS idx_messages_fts ON messages USING GIN (fts);
+            ",
+        )
+        .map_err(pg_err)?;
+
     // A vector index needs a concrete dimension; create it after the
     // table exists. HNSW is available in pgvector >= 0.5 (the images we
     // target ship a newer version).
@@ -1514,229 +1653,1691 @@ impl MemoryStore for PostgresStore {
 }
 
 // ---------------------------------------------------------------------------
-// Unsupported subsystems on this backend (first cut, issue #301).
+// Facts / memoir / feedback / transcript subsystems (F-003a).
 //
-// These return `IcmError::Unsupported` so the binary keeps working for the
-// core shared-memory use case while the heavier subsystems remain on the
-// default SQLite backend. A follow-up can port them.
+// Full parity with the SQLite backend (issue #301 follow-up): a central
+// Postgres node is a complete replacement, not core-memory only. Row
+// extraction uses `try_get` + `pg_err` (no panic path); full-text search
+// uses the tsvector('simple') GENERATED columns + GIN indexes from
+// `init_schema`. These subsystems ignore the pre-seeded `tenant` column —
+// tenant isolation is F-003b.
 // ---------------------------------------------------------------------------
 
-fn unsupported<T>(op: &str) -> IcmResult<T> {
-    Err(IcmError::Unsupported(format!(
-        "{op} (use the default SQLite backend)"
-    )))
+const MEMOIR_COLS: &str = "id, name, description, created_at, updated_at, consolidation_threshold";
+const CONCEPT_COLS: &str = "id, memoir_id, name, definition, labels, confidence, \
+                            revision, created_at, updated_at, source_memory_ids";
+const LINK_COLS: &str = "id, source_id, target_id, relation, weight, created_at";
+
+fn row_to_link(row: &postgres::Row) -> IcmResult<ConceptLink> {
+    let relation_str: String = row.try_get(3).map_err(pg_err)?;
+    Ok(ConceptLink {
+        id: row.try_get(0).map_err(pg_err)?,
+        source_id: row.try_get(1).map_err(pg_err)?,
+        target_id: row.try_get(2).map_err(pg_err)?,
+        relation: relation_str.parse().unwrap_or(Relation::RelatedTo),
+        weight: row.try_get(4).map_err(pg_err)?,
+        created_at: row.try_get(5).map_err(pg_err)?,
+    })
+}
+
+fn row_to_memoir(row: &postgres::Row) -> IcmResult<Memoir> {
+    let threshold: i32 = row.try_get(5).map_err(pg_err)?;
+    Ok(Memoir {
+        id: row.try_get(0).map_err(pg_err)?,
+        name: row.try_get(1).map_err(pg_err)?,
+        description: row.try_get(2).map_err(pg_err)?,
+        created_at: row.try_get(3).map_err(pg_err)?,
+        updated_at: row.try_get(4).map_err(pg_err)?,
+        consolidation_threshold: threshold as u32,
+    })
+}
+
+fn row_to_concept(row: &postgres::Row) -> IcmResult<Concept> {
+    let labels_json: String = row.try_get(4).map_err(pg_err)?;
+    let revision: i32 = row.try_get(6).map_err(pg_err)?;
+    let source_ids_json: String = row.try_get(9).map_err(pg_err)?;
+    Ok(Concept {
+        id: row.try_get(0).map_err(pg_err)?,
+        memoir_id: row.try_get(1).map_err(pg_err)?,
+        name: row.try_get(2).map_err(pg_err)?,
+        definition: row.try_get(3).map_err(pg_err)?,
+        labels: serde_json::from_str(&labels_json).unwrap_or_default(),
+        confidence: row.try_get(5).map_err(pg_err)?,
+        revision: revision as u32,
+        created_at: row.try_get(7).map_err(pg_err)?,
+        updated_at: row.try_get(8).map_err(pg_err)?,
+        source_memory_ids: serde_json::from_str(&source_ids_json).unwrap_or_default(),
+    })
 }
 
 impl MemoirStore for PostgresStore {
-    fn create_memoir(&self, _memoir: Memoir) -> IcmResult<String> {
-        unsupported("memoir.create_memoir")
+    fn create_memoir(&self, memoir: Memoir) -> IcmResult<String> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("create_memoir".into()));
+        }
+        let mut c = self.conn()?;
+        c.execute(
+            "INSERT INTO memoirs (id, name, description, created_at, updated_at, consolidation_threshold)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            &[
+                &memoir.id,
+                &memoir.name,
+                &memoir.description,
+                &memoir.created_at,
+                &memoir.updated_at,
+                &(memoir.consolidation_threshold as i32),
+            ],
+        )
+        .map_err(pg_err)?;
+        Ok(memoir.id)
     }
-    fn get_memoir(&self, _id: &str) -> IcmResult<Option<Memoir>> {
-        unsupported("memoir.get_memoir")
+    fn get_memoir(&self, id: &str) -> IcmResult<Option<Memoir>> {
+        let mut c = self.conn()?;
+        let row = c
+            .query_opt(
+                &format!("SELECT {MEMOIR_COLS} FROM memoirs WHERE id = $1"),
+                &[&id],
+            )
+            .map_err(pg_err)?;
+        row.as_ref().map(row_to_memoir).transpose()
     }
-    fn get_memoir_by_name(&self, _name: &str) -> IcmResult<Option<Memoir>> {
-        unsupported("memoir.get_memoir_by_name")
+    fn get_memoir_by_name(&self, name: &str) -> IcmResult<Option<Memoir>> {
+        let mut c = self.conn()?;
+        let row = c
+            .query_opt(
+                &format!("SELECT {MEMOIR_COLS} FROM memoirs WHERE name = $1"),
+                &[&name],
+            )
+            .map_err(pg_err)?;
+        row.as_ref().map(row_to_memoir).transpose()
     }
-    fn update_memoir(&self, _memoir: &Memoir) -> IcmResult<()> {
-        unsupported("memoir.update_memoir")
+    fn update_memoir(&self, memoir: &Memoir) -> IcmResult<()> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("update_memoir".into()));
+        }
+        let mut c = self.conn()?;
+        let changed = c
+            .execute(
+                "UPDATE memoirs SET name = $2, description = $3, updated_at = $4,
+                 consolidation_threshold = $5 WHERE id = $1",
+                &[
+                    &memoir.id,
+                    &memoir.name,
+                    &memoir.description,
+                    &memoir.updated_at,
+                    &(memoir.consolidation_threshold as i32),
+                ],
+            )
+            .map_err(pg_err)?;
+        if changed == 0 {
+            return Err(IcmError::NotFound(memoir.id.clone()));
+        }
+        Ok(())
     }
-    fn delete_memoir(&self, _id: &str) -> IcmResult<()> {
-        unsupported("memoir.delete_memoir")
+    fn delete_memoir(&self, id: &str) -> IcmResult<()> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("delete_memoir".into()));
+        }
+        let mut c = self.conn()?;
+        let changed = c
+            .execute("DELETE FROM memoirs WHERE id = $1", &[&id])
+            .map_err(pg_err)?;
+        if changed == 0 {
+            return Err(IcmError::NotFound(id.to_string()));
+        }
+        Ok(())
     }
     fn list_memoirs(&self) -> IcmResult<Vec<Memoir>> {
-        unsupported("memoir.list_memoirs")
+        let mut c = self.conn()?;
+        let rows = c
+            .query(
+                &format!("SELECT {MEMOIR_COLS} FROM memoirs ORDER BY name LIMIT 500"),
+                &[],
+            )
+            .map_err(pg_err)?;
+        rows.iter().map(row_to_memoir).collect()
     }
-    fn add_concept(&self, _concept: Concept) -> IcmResult<String> {
-        unsupported("memoir.add_concept")
+    fn add_concept(&self, concept: Concept) -> IcmResult<String> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("add_concept".into()));
+        }
+        let labels_json = serde_json::to_string(&concept.labels)?;
+        let source_ids_json = serde_json::to_string(&concept.source_memory_ids)?;
+        let mut c = self.conn()?;
+        c.execute(
+            "INSERT INTO concepts
+                (id, memoir_id, name, definition, labels, confidence, revision,
+                 created_at, updated_at, source_memory_ids)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            &[
+                &concept.id,
+                &concept.memoir_id,
+                &concept.name,
+                &concept.definition,
+                &labels_json,
+                &concept.confidence,
+                &(concept.revision as i32),
+                &concept.created_at,
+                &concept.updated_at,
+                &source_ids_json,
+            ],
+        )
+        .map_err(pg_err)?;
+        Ok(concept.id)
     }
-    fn get_concept(&self, _id: &str) -> IcmResult<Option<Concept>> {
-        unsupported("memoir.get_concept")
+    fn get_concept(&self, id: &str) -> IcmResult<Option<Concept>> {
+        let mut c = self.conn()?;
+        let row = c
+            .query_opt(
+                &format!("SELECT {CONCEPT_COLS} FROM concepts WHERE id = $1"),
+                &[&id],
+            )
+            .map_err(pg_err)?;
+        row.as_ref().map(row_to_concept).transpose()
     }
-    fn get_concept_by_name(&self, _memoir_id: &str, _name: &str) -> IcmResult<Option<Concept>> {
-        unsupported("memoir.get_concept_by_name")
+    fn get_concept_by_name(&self, memoir_id: &str, name: &str) -> IcmResult<Option<Concept>> {
+        let mut c = self.conn()?;
+        let row = c
+            .query_opt(
+                &format!("SELECT {CONCEPT_COLS} FROM concepts WHERE memoir_id = $1 AND name = $2"),
+                &[&memoir_id, &name],
+            )
+            .map_err(pg_err)?;
+        row.as_ref().map(row_to_concept).transpose()
     }
-    fn update_concept(&self, _concept: &Concept) -> IcmResult<()> {
-        unsupported("memoir.update_concept")
+    fn update_concept(&self, concept: &Concept) -> IcmResult<()> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("update_concept".into()));
+        }
+        let labels_json = serde_json::to_string(&concept.labels)?;
+        let source_ids_json = serde_json::to_string(&concept.source_memory_ids)?;
+        let mut c = self.conn()?;
+        let changed = c
+            .execute(
+                "UPDATE concepts SET memoir_id = $2, name = $3, definition = $4, labels = $5,
+                 confidence = $6, revision = $7, updated_at = $8, source_memory_ids = $9
+                 WHERE id = $1",
+                &[
+                    &concept.id,
+                    &concept.memoir_id,
+                    &concept.name,
+                    &concept.definition,
+                    &labels_json,
+                    &concept.confidence,
+                    &(concept.revision as i32),
+                    &concept.updated_at,
+                    &source_ids_json,
+                ],
+            )
+            .map_err(pg_err)?;
+        if changed == 0 {
+            return Err(IcmError::NotFound(concept.id.clone()));
+        }
+        Ok(())
     }
-    fn delete_concept(&self, _id: &str) -> IcmResult<()> {
-        unsupported("memoir.delete_concept")
+    fn delete_concept(&self, id: &str) -> IcmResult<()> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("delete_concept".into()));
+        }
+        let mut c = self.conn()?;
+        let changed = c
+            .execute("DELETE FROM concepts WHERE id = $1", &[&id])
+            .map_err(pg_err)?;
+        if changed == 0 {
+            return Err(IcmError::NotFound(id.to_string()));
+        }
+        Ok(())
     }
-    fn list_concepts(&self, _memoir_id: &str) -> IcmResult<Vec<Concept>> {
-        unsupported("memoir.list_concepts")
+    fn list_concepts(&self, memoir_id: &str) -> IcmResult<Vec<Concept>> {
+        let mut c = self.conn()?;
+        let rows = c
+            .query(
+                &format!(
+                    "SELECT {CONCEPT_COLS} FROM concepts
+                     WHERE memoir_id = $1 ORDER BY name LIMIT 1000"
+                ),
+                &[&memoir_id],
+            )
+            .map_err(pg_err)?;
+        rows.iter().map(row_to_concept).collect()
     }
     fn search_concepts_fts(
         &self,
-        _memoir_id: &str,
-        _query: &str,
-        _limit: usize,
+        memoir_id: &str,
+        query: &str,
+        limit: usize,
     ) -> IcmResult<Vec<Concept>> {
-        unsupported("memoir.search_concepts_fts")
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut c = self.conn()?;
+        let lim = limit as i64;
+        let rows = c
+            .query(
+                &format!(
+                    "SELECT {CONCEPT_COLS} FROM concepts
+                     WHERE memoir_id = $1 AND fts @@ plainto_tsquery('simple', $2)
+                     ORDER BY confidence DESC LIMIT $3"
+                ),
+                &[&memoir_id, &query, &lim],
+            )
+            .map_err(pg_err)?;
+        rows.iter().map(row_to_concept).collect()
     }
     fn search_concepts_by_label(
         &self,
-        _memoir_id: &str,
-        _label: &Label,
-        _limit: usize,
+        memoir_id: &str,
+        label: &Label,
+        limit: usize,
     ) -> IcmResult<Vec<Concept>> {
-        unsupported("memoir.search_concepts_by_label")
+        // Match the serialized JSON labels column (parity with SQLite).
+        let pattern = format!(
+            "%\"namespace\":\"{}\"%\"value\":\"{}\"%",
+            label.namespace, label.value
+        );
+        let mut c = self.conn()?;
+        let lim = limit as i64;
+        let rows = c
+            .query(
+                &format!(
+                    "SELECT {CONCEPT_COLS} FROM concepts
+                     WHERE memoir_id = $1 AND labels LIKE $2
+                     ORDER BY confidence DESC LIMIT $3"
+                ),
+                &[&memoir_id, &pattern, &lim],
+            )
+            .map_err(pg_err)?;
+        rows.iter().map(row_to_concept).collect()
     }
-    fn search_all_concepts_fts(&self, _query: &str, _limit: usize) -> IcmResult<Vec<Concept>> {
-        unsupported("memoir.search_all_concepts_fts")
+    fn search_all_concepts_fts(&self, query: &str, limit: usize) -> IcmResult<Vec<Concept>> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut c = self.conn()?;
+        let lim = limit as i64;
+        let rows = c
+            .query(
+                &format!(
+                    "SELECT {CONCEPT_COLS} FROM concepts
+                     WHERE fts @@ plainto_tsquery('simple', $1)
+                     ORDER BY confidence DESC LIMIT $2"
+                ),
+                &[&query, &lim],
+            )
+            .map_err(pg_err)?;
+        rows.iter().map(row_to_concept).collect()
     }
     fn refine_concept(
         &self,
-        _id: &str,
-        _new_definition: &str,
-        _new_source_ids: &[String],
+        id: &str,
+        new_definition: &str,
+        new_source_ids: &[String],
     ) -> IcmResult<()> {
-        unsupported("memoir.refine_concept")
+        if self.readonly {
+            return Err(IcmError::ReadOnly("refine_concept".into()));
+        }
+        let concept = self
+            .get_concept(id)?
+            .ok_or_else(|| IcmError::NotFound(id.to_string()))?;
+        let mut merged = concept.source_memory_ids;
+        for sid in new_source_ids {
+            if !merged.contains(sid) {
+                merged.push(sid.clone());
+            }
+        }
+        let source_ids_json = serde_json::to_string(&merged)?;
+        let new_confidence = (concept.confidence + 0.1).min(1.0);
+        let mut c = self.conn()?;
+        c.execute(
+            "UPDATE concepts SET definition = $2, revision = revision + 1,
+             confidence = $3, updated_at = $4, source_memory_ids = $5
+             WHERE id = $1",
+            &[
+                &id,
+                &new_definition,
+                &new_confidence,
+                &Utc::now(),
+                &source_ids_json,
+            ],
+        )
+        .map_err(pg_err)?;
+        Ok(())
     }
-    fn add_link(&self, _link: ConceptLink) -> IcmResult<String> {
-        unsupported("memoir.add_link")
+    fn add_link(&self, link: ConceptLink) -> IcmResult<String> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("add_link".into()));
+        }
+        // The store is the authoritative invariant gate: reject self-links
+        // and edges that would close a cycle (source → target → … → source).
+        if link.source_id == link.target_id {
+            return Err(IcmError::InvalidInput(format!(
+                "self-link rejected: source and target are the same concept ({})",
+                link.source_id
+            )));
+        }
+        {
+            // Reachability check via recursive CTE: can `target` already
+            // reach `source` along outgoing edges? If so, the new edge
+            // closes a cycle.
+            let mut c = self.conn()?;
+            let cyclic: bool = c
+                .query_one(
+                    "WITH RECURSIVE reach(id) AS (
+                         SELECT target_id FROM concept_links WHERE source_id = $1
+                         UNION
+                         SELECT cl.target_id FROM concept_links cl
+                             JOIN reach r ON cl.source_id = r.id
+                     )
+                     SELECT EXISTS(SELECT 1 FROM reach WHERE id = $2)",
+                    &[&link.target_id, &link.source_id],
+                )
+                .map_err(pg_err)?
+                .try_get(0)
+                .map_err(pg_err)?;
+            if cyclic {
+                return Err(IcmError::InvalidInput(format!(
+                    "concept link rejected: {} → {} would create a cycle in the graph",
+                    link.source_id, link.target_id
+                )));
+            }
+        }
+        let mut c = self.conn()?;
+        c.execute(
+            "INSERT INTO concept_links (id, source_id, target_id, relation, weight, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            &[
+                &link.id,
+                &link.source_id,
+                &link.target_id,
+                &link.relation.to_string(),
+                &link.weight,
+                &link.created_at,
+            ],
+        )
+        .map_err(pg_err)?;
+        Ok(link.id)
     }
-    fn get_links_from(&self, _concept_id: &str) -> IcmResult<Vec<ConceptLink>> {
-        unsupported("memoir.get_links_from")
+    fn get_links_from(&self, concept_id: &str) -> IcmResult<Vec<ConceptLink>> {
+        let mut c = self.conn()?;
+        let rows = c
+            .query(
+                &format!("SELECT {LINK_COLS} FROM concept_links WHERE source_id = $1"),
+                &[&concept_id],
+            )
+            .map_err(pg_err)?;
+        rows.iter().map(row_to_link).collect()
     }
-    fn get_links_to(&self, _concept_id: &str) -> IcmResult<Vec<ConceptLink>> {
-        unsupported("memoir.get_links_to")
+    fn get_links_to(&self, concept_id: &str) -> IcmResult<Vec<ConceptLink>> {
+        let mut c = self.conn()?;
+        let rows = c
+            .query(
+                &format!("SELECT {LINK_COLS} FROM concept_links WHERE target_id = $1"),
+                &[&concept_id],
+            )
+            .map_err(pg_err)?;
+        rows.iter().map(row_to_link).collect()
     }
-    fn delete_link(&self, _id: &str) -> IcmResult<()> {
-        unsupported("memoir.delete_link")
+    fn delete_link(&self, id: &str) -> IcmResult<()> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("delete_link".into()));
+        }
+        let mut c = self.conn()?;
+        let changed = c
+            .execute("DELETE FROM concept_links WHERE id = $1", &[&id])
+            .map_err(pg_err)?;
+        if changed == 0 {
+            return Err(IcmError::NotFound(id.to_string()));
+        }
+        Ok(())
     }
     fn get_neighbors(
         &self,
-        _concept_id: &str,
-        _relation: Option<Relation>,
+        concept_id: &str,
+        relation: Option<Relation>,
     ) -> IcmResult<Vec<Concept>> {
-        unsupported("memoir.get_neighbors")
+        // Undirected: a neighbor is the other endpoint of any incident edge.
+        let mut c = self.conn()?;
+        let rows = match relation {
+            Some(r) => {
+                let rel = r.to_string();
+                c.query(
+                    &format!(
+                        "SELECT {CONCEPT_COLS} FROM concepts WHERE id IN (
+                             SELECT target_id FROM concept_links
+                                 WHERE source_id = $1 AND relation = $2
+                             UNION
+                             SELECT source_id FROM concept_links
+                                 WHERE target_id = $1 AND relation = $2
+                         )"
+                    ),
+                    &[&concept_id, &rel],
+                )
+                .map_err(pg_err)?
+            }
+            None => c
+                .query(
+                    &format!(
+                        "SELECT {CONCEPT_COLS} FROM concepts WHERE id IN (
+                             SELECT target_id FROM concept_links WHERE source_id = $1
+                             UNION
+                             SELECT source_id FROM concept_links WHERE target_id = $1
+                         )"
+                    ),
+                    &[&concept_id],
+                )
+                .map_err(pg_err)?,
+        };
+        rows.iter().map(row_to_concept).collect()
     }
     fn get_neighborhood(
         &self,
-        _concept_id: &str,
-        _depth: usize,
+        concept_id: &str,
+        depth: usize,
     ) -> IcmResult<(Vec<Concept>, Vec<ConceptLink>)> {
-        unsupported("memoir.get_neighborhood")
+        // Breadth-first walk in both directions, depth-bounded, deduping
+        // concepts via `visited` (mirrors the SQLite backend exactly).
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+        let mut concepts = Vec::new();
+        let mut links = Vec::new();
+
+        match self.get_concept(concept_id)? {
+            Some(root) => {
+                visited.insert(root.id.clone());
+                queue.push_back((root.id.clone(), 0));
+                concepts.push(root);
+            }
+            None => return Err(IcmError::NotFound(concept_id.to_string())),
+        }
+
+        while let Some((current_id, current_depth)) = queue.pop_front() {
+            if current_depth >= depth {
+                continue;
+            }
+            for link in self.get_links_from(&current_id)? {
+                if !visited.contains(&link.target_id) {
+                    if let Some(c) = self.get_concept(&link.target_id)? {
+                        visited.insert(c.id.clone());
+                        queue.push_back((c.id.clone(), current_depth + 1));
+                        concepts.push(c);
+                    }
+                }
+                links.push(link);
+            }
+            for link in self.get_links_to(&current_id)? {
+                if !visited.contains(&link.source_id) {
+                    if let Some(c) = self.get_concept(&link.source_id)? {
+                        visited.insert(c.id.clone());
+                        queue.push_back((c.id.clone(), current_depth + 1));
+                        concepts.push(c);
+                    }
+                }
+                links.push(link);
+            }
+        }
+        Ok((concepts, links))
     }
-    fn get_links_for_memoir(&self, _memoir_id: &str) -> IcmResult<Vec<ConceptLink>> {
-        unsupported("memoir.get_links_for_memoir")
+    fn get_links_for_memoir(&self, memoir_id: &str) -> IcmResult<Vec<ConceptLink>> {
+        let mut c = self.conn()?;
+        let rows = c
+            .query(
+                &format!(
+                    "SELECT {LINK_COLS} FROM concept_links
+                     WHERE source_id IN (SELECT id FROM concepts WHERE memoir_id = $1)
+                     LIMIT 5000"
+                ),
+                &[&memoir_id],
+            )
+            .map_err(pg_err)?;
+        rows.iter().map(row_to_link).collect()
     }
-    fn memoir_stats(&self, _memoir_id: &str) -> IcmResult<MemoirStats> {
-        unsupported("memoir.memoir_stats")
+    fn memoir_stats(&self, memoir_id: &str) -> IcmResult<MemoirStats> {
+        let mut c = self.conn()?;
+        let total_concepts: i64 = c
+            .query_one(
+                "SELECT COUNT(*) FROM concepts WHERE memoir_id = $1",
+                &[&memoir_id],
+            )
+            .map_err(pg_err)?
+            .try_get(0)
+            .map_err(pg_err)?;
+        let total_links: i64 = c
+            .query_one(
+                "SELECT COUNT(*) FROM concept_links
+                 WHERE source_id IN (SELECT id FROM concepts WHERE memoir_id = $1)",
+                &[&memoir_id],
+            )
+            .map_err(pg_err)?
+            .try_get(0)
+            .map_err(pg_err)?;
+        let avg_confidence: f32 = if total_concepts > 0 {
+            c.query_one(
+                "SELECT COALESCE(AVG(confidence), 0)::real FROM concepts WHERE memoir_id = $1",
+                &[&memoir_id],
+            )
+            .map_err(pg_err)?
+            .try_get(0)
+            .map_err(pg_err)?
+        } else {
+            0.0
+        };
+        // Count labels in-app (JSON column), mirroring SQLite.
+        let label_rows = c
+            .query(
+                "SELECT labels FROM concepts WHERE memoir_id = $1 AND labels <> '[]'",
+                &[&memoir_id],
+            )
+            .map_err(pg_err)?;
+        let mut label_map: HashMap<String, usize> = HashMap::new();
+        for row in &label_rows {
+            let raw: String = row.try_get(0).map_err(pg_err)?;
+            if let Ok(labels) = serde_json::from_str::<Vec<Label>>(&raw) {
+                for l in labels {
+                    *label_map.entry(l.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut label_counts: Vec<(String, usize)> = label_map.into_iter().collect();
+        label_counts.sort_by_key(|b| std::cmp::Reverse(b.1));
+
+        Ok(MemoirStats {
+            total_concepts: total_concepts as usize,
+            total_links: total_links as usize,
+            avg_confidence,
+            label_counts,
+        })
     }
     fn batch_memoir_concept_counts(&self) -> IcmResult<HashMap<String, usize>> {
-        unsupported("memoir.batch_memoir_concept_counts")
+        let mut c = self.conn()?;
+        let rows = c
+            .query(
+                "SELECT memoir_id, COUNT(*) FROM concepts GROUP BY memoir_id",
+                &[],
+            )
+            .map_err(pg_err)?;
+        let mut map = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let id: String = row.try_get(0).map_err(pg_err)?;
+            let count: i64 = row.try_get(1).map_err(pg_err)?;
+            map.insert(id, count as usize);
+        }
+        Ok(map)
     }
+}
+
+/// Columns selected for a [`Feedback`], in `row_to_feedback` order.
+const FEEDBACK_COLS: &str =
+    "id, topic, context, predicted, corrected, reason, source, created_at, applied_count";
+
+fn row_to_feedback(row: &postgres::Row) -> IcmResult<Feedback> {
+    let applied: i32 = row.try_get(8).map_err(pg_err)?;
+    Ok(Feedback {
+        id: row.try_get(0).map_err(pg_err)?,
+        topic: row.try_get(1).map_err(pg_err)?,
+        context: row.try_get(2).map_err(pg_err)?,
+        predicted: row.try_get(3).map_err(pg_err)?,
+        corrected: row.try_get(4).map_err(pg_err)?,
+        reason: row.try_get(5).map_err(pg_err)?,
+        source: row.try_get(6).map_err(pg_err)?,
+        created_at: row.try_get(7).map_err(pg_err)?,
+        applied_count: applied as u32,
+    })
 }
 
 impl FeedbackStore for PostgresStore {
-    fn store_feedback(&self, _feedback: Feedback) -> IcmResult<String> {
-        unsupported("feedback.store_feedback")
+    fn store_feedback(&self, feedback: Feedback) -> IcmResult<String> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("store_feedback".into()));
+        }
+        let mut c = self.conn()?;
+        c.execute(
+            "INSERT INTO feedback
+                (id, topic, context, predicted, corrected, reason, source, created_at, applied_count)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            &[
+                &feedback.id,
+                &feedback.topic,
+                &feedback.context,
+                &feedback.predicted,
+                &feedback.corrected,
+                &feedback.reason,
+                &feedback.source,
+                &feedback.created_at,
+                &(feedback.applied_count as i32),
+            ],
+        )
+        .map_err(pg_err)?;
+        Ok(feedback.id)
     }
+
     fn search_feedback(
         &self,
-        _query: &str,
-        _topic: Option<&str>,
-        _limit: usize,
+        query: &str,
+        topic: Option<&str>,
+        limit: usize,
     ) -> IcmResult<Vec<Feedback>> {
-        unsupported("feedback.search_feedback")
+        // Empty query → recency list (mirrors the SQLite FTS fallback).
+        if query.trim().is_empty() {
+            return self.list_feedback(topic, limit);
+        }
+        let mut c = self.conn()?;
+        let lim = limit as i64;
+        // Filter by tsvector match, order by recency (parity with SQLite).
+        let rows = match topic {
+            Some(t) => c
+                .query(
+                    &format!(
+                        "SELECT {FEEDBACK_COLS} FROM feedback
+                         WHERE fts @@ plainto_tsquery('simple', $1) AND topic = $2
+                         ORDER BY created_at DESC LIMIT $3"
+                    ),
+                    &[&query, &t, &lim],
+                )
+                .map_err(pg_err)?,
+            None => c
+                .query(
+                    &format!(
+                        "SELECT {FEEDBACK_COLS} FROM feedback
+                         WHERE fts @@ plainto_tsquery('simple', $1)
+                         ORDER BY created_at DESC LIMIT $2"
+                    ),
+                    &[&query, &lim],
+                )
+                .map_err(pg_err)?,
+        };
+        rows.iter().map(row_to_feedback).collect()
     }
-    fn list_feedback(&self, _topic: Option<&str>, _limit: usize) -> IcmResult<Vec<Feedback>> {
-        unsupported("feedback.list_feedback")
+
+    fn list_feedback(&self, topic: Option<&str>, limit: usize) -> IcmResult<Vec<Feedback>> {
+        let mut c = self.conn()?;
+        let lim = limit as i64;
+        let rows = match topic {
+            Some(t) => c
+                .query(
+                    &format!(
+                        "SELECT {FEEDBACK_COLS} FROM feedback
+                         WHERE topic = $1 ORDER BY created_at DESC LIMIT $2"
+                    ),
+                    &[&t, &lim],
+                )
+                .map_err(pg_err)?,
+            None => c
+                .query(
+                    &format!(
+                        "SELECT {FEEDBACK_COLS} FROM feedback ORDER BY created_at DESC LIMIT $1"
+                    ),
+                    &[&lim],
+                )
+                .map_err(pg_err)?,
+        };
+        rows.iter().map(row_to_feedback).collect()
     }
-    fn increment_applied(&self, _id: &str) -> IcmResult<()> {
-        unsupported("feedback.increment_applied")
+
+    fn increment_applied(&self, id: &str) -> IcmResult<()> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("increment_applied".into()));
+        }
+        let mut c = self.conn()?;
+        let changed = c
+            .execute(
+                "UPDATE feedback SET applied_count = applied_count + 1 WHERE id = $1",
+                &[&id],
+            )
+            .map_err(pg_err)?;
+        if changed == 0 {
+            return Err(IcmError::NotFound(id.to_string()));
+        }
+        Ok(())
     }
-    fn delete_feedback(&self, _id: &str) -> IcmResult<()> {
-        unsupported("feedback.delete_feedback")
+
+    fn delete_feedback(&self, id: &str) -> IcmResult<()> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("delete_feedback".into()));
+        }
+        let mut c = self.conn()?;
+        let changed = c
+            .execute("DELETE FROM feedback WHERE id = $1", &[&id])
+            .map_err(pg_err)?;
+        if changed == 0 {
+            return Err(IcmError::NotFound(id.to_string()));
+        }
+        Ok(())
     }
+
     fn feedback_stats(&self) -> IcmResult<FeedbackStats> {
-        unsupported("feedback.feedback_stats")
+        let mut c = self.conn()?;
+        let total: i64 = c
+            .query_one("SELECT COUNT(*) FROM feedback", &[])
+            .map_err(pg_err)?
+            .try_get(0)
+            .map_err(pg_err)?;
+        let by_topic_rows = c
+            .query(
+                "SELECT topic, COUNT(*) AS cnt FROM feedback GROUP BY topic ORDER BY cnt DESC",
+                &[],
+            )
+            .map_err(pg_err)?;
+        let mut by_topic = Vec::with_capacity(by_topic_rows.len());
+        for row in &by_topic_rows {
+            let topic: String = row.try_get(0).map_err(pg_err)?;
+            let cnt: i64 = row.try_get(1).map_err(pg_err)?;
+            by_topic.push((topic, cnt as usize));
+        }
+        let ma_rows = c
+            .query(
+                "SELECT id, applied_count FROM feedback
+                 WHERE applied_count > 0 ORDER BY applied_count DESC LIMIT 10",
+                &[],
+            )
+            .map_err(pg_err)?;
+        let mut most_applied = Vec::with_capacity(ma_rows.len());
+        for row in &ma_rows {
+            let id: String = row.try_get(0).map_err(pg_err)?;
+            let n: i32 = row.try_get(1).map_err(pg_err)?;
+            most_applied.push((id, n as u32));
+        }
+        Ok(FeedbackStats {
+            total: total as usize,
+            by_topic,
+            most_applied,
+        })
     }
 }
 
+/// Columns selected for a [`Fact`], in `row_to_fact` order.
+const FACT_COLS: &str = "id, entity, key, value, source, created_at, superseded_at";
+
+fn row_to_fact(row: &postgres::Row) -> IcmResult<Fact> {
+    Ok(Fact {
+        id: row.try_get(0).map_err(pg_err)?,
+        entity: row.try_get(1).map_err(pg_err)?,
+        key: row.try_get(2).map_err(pg_err)?,
+        value: row.try_get(3).map_err(pg_err)?,
+        source: row.try_get(4).map_err(pg_err)?,
+        created_at: row.try_get(5).map_err(pg_err)?,
+        superseded_at: row.try_get(6).map_err(pg_err)?,
+    })
+}
+
 impl FactsStore for PostgresStore {
-    fn set_fact(
-        &self,
-        _entity: &str,
-        _key: &str,
-        _value: &str,
-        _source: &str,
-    ) -> IcmResult<String> {
-        unsupported("facts.set_fact")
+    fn set_fact(&self, entity: &str, key: &str, value: &str, source: &str) -> IcmResult<String> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("set_fact".into()));
+        }
+        if entity.is_empty() || key.is_empty() {
+            return Err(IcmError::InvalidInput(
+                "entity and key must be non-empty".into(),
+            ));
+        }
+        let mut c = self.conn()?;
+        // Transactional supersede+insert so two concurrent writers can't
+        // both land an active row for the same (entity, key) slot.
+        let mut tx = c.transaction().map_err(pg_err)?;
+        let existing = tx
+            .query_opt(
+                "SELECT id, value FROM facts
+                 WHERE entity = $1 AND key = $2 AND superseded_at IS NULL",
+                &[&entity, &key],
+            )
+            .map_err(pg_err)?;
+        if let Some(row) = existing {
+            let id: String = row.try_get(0).map_err(pg_err)?;
+            let current: String = row.try_get(1).map_err(pg_err)?;
+            if current == value {
+                // Same value re-asserted → no-op.
+                tx.commit().map_err(pg_err)?;
+                return Ok(id);
+            }
+            tx.execute(
+                "UPDATE facts SET superseded_at = $1 WHERE id = $2",
+                &[&Utc::now(), &id],
+            )
+            .map_err(pg_err)?;
+        }
+        let new = Fact::new(
+            entity.to_string(),
+            key.to_string(),
+            value.to_string(),
+            source.to_string(),
+        );
+        tx.execute(
+            "INSERT INTO facts (id, entity, key, value, source, created_at, superseded_at)
+             VALUES ($1, $2, $3, $4, $5, $6, NULL)",
+            &[
+                &new.id,
+                &new.entity,
+                &new.key,
+                &new.value,
+                &new.source,
+                &new.created_at,
+            ],
+        )
+        .map_err(pg_err)?;
+        tx.commit().map_err(pg_err)?;
+        Ok(new.id)
     }
-    fn get_fact(&self, _entity: &str, _key: &str) -> IcmResult<Option<Fact>> {
-        unsupported("facts.get_fact")
+
+    fn get_fact(&self, entity: &str, key: &str) -> IcmResult<Option<Fact>> {
+        let mut c = self.conn()?;
+        let row = c
+            .query_opt(
+                &format!(
+                    "SELECT {FACT_COLS} FROM facts
+                     WHERE entity = $1 AND key = $2 AND superseded_at IS NULL"
+                ),
+                &[&entity, &key],
+            )
+            .map_err(pg_err)?;
+        row.as_ref().map(row_to_fact).transpose()
     }
-    fn list_facts(&self, _entity: &str, _key_prefix: Option<&str>) -> IcmResult<Vec<Fact>> {
-        unsupported("facts.list_facts")
+
+    fn list_facts(&self, entity: &str, key_prefix: Option<&str>) -> IcmResult<Vec<Fact>> {
+        let mut c = self.conn()?;
+        let rows = match key_prefix {
+            Some(p) if !p.is_empty() => {
+                let pattern = format!("{p}%");
+                c.query(
+                    &format!(
+                        "SELECT {FACT_COLS} FROM facts
+                         WHERE entity = $1 AND key LIKE $2 AND superseded_at IS NULL
+                         ORDER BY key ASC"
+                    ),
+                    &[&entity, &pattern],
+                )
+                .map_err(pg_err)?
+            }
+            _ => c
+                .query(
+                    &format!(
+                        "SELECT {FACT_COLS} FROM facts
+                         WHERE entity = $1 AND superseded_at IS NULL
+                         ORDER BY key ASC"
+                    ),
+                    &[&entity],
+                )
+                .map_err(pg_err)?,
+        };
+        rows.iter().map(row_to_fact).collect()
     }
-    fn history(&self, _entity: &str, _key: &str) -> IcmResult<Vec<Fact>> {
-        unsupported("facts.history")
+
+    fn history(&self, entity: &str, key: &str) -> IcmResult<Vec<Fact>> {
+        let mut c = self.conn()?;
+        let rows = c
+            .query(
+                &format!(
+                    "SELECT {FACT_COLS} FROM facts
+                     WHERE entity = $1 AND key = $2
+                     ORDER BY created_at DESC"
+                ),
+                &[&entity, &key],
+            )
+            .map_err(pg_err)?;
+        rows.iter().map(row_to_fact).collect()
     }
-    fn forget_fact(&self, _entity: &str, _key: &str) -> IcmResult<usize> {
-        unsupported("facts.forget_fact")
+
+    fn forget_fact(&self, entity: &str, key: &str) -> IcmResult<usize> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("forget_fact".into()));
+        }
+        let mut c = self.conn()?;
+        let n = c
+            .execute(
+                "DELETE FROM facts WHERE entity = $1 AND key = $2",
+                &[&entity, &key],
+            )
+            .map_err(pg_err)?;
+        Ok(n as usize)
     }
+
     fn facts_stats(&self) -> IcmResult<FactsStats> {
-        unsupported("facts.facts_stats")
+        let mut c = self.conn()?;
+        let count = |c: &mut MutexGuard<'_, Client>, sql: &str| -> IcmResult<usize> {
+            let n: i64 = c
+                .query_one(sql, &[])
+                .map_err(pg_err)?
+                .try_get(0)
+                .map_err(pg_err)?;
+            Ok(n as usize)
+        };
+        let active_count = count(
+            &mut c,
+            "SELECT COUNT(*) FROM facts WHERE superseded_at IS NULL",
+        )?;
+        let total_count = count(&mut c, "SELECT COUNT(*) FROM facts")?;
+        let distinct_entities = count(
+            &mut c,
+            "SELECT COUNT(DISTINCT entity) FROM facts WHERE superseded_at IS NULL",
+        )?;
+        let rows = c
+            .query(
+                "SELECT entity, COUNT(*) AS n FROM facts
+                 WHERE superseded_at IS NULL
+                 GROUP BY entity ORDER BY n DESC LIMIT 10",
+                &[],
+            )
+            .map_err(pg_err)?;
+        let mut top_entities = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let entity: String = row.try_get(0).map_err(pg_err)?;
+            let n: i64 = row.try_get(1).map_err(pg_err)?;
+            top_entities.push((entity, n as usize));
+        }
+        Ok(FactsStats {
+            active_count,
+            total_count,
+            distinct_entities,
+            top_entities,
+        })
     }
+}
+
+const SESSION_COLS: &str = "id, agent, project, started_at, updated_at, metadata";
+const MESSAGE_COLS: &str = "id, session_id, role, content, tool_name, tokens, ts, metadata";
+
+fn row_to_session(row: &postgres::Row) -> IcmResult<Session> {
+    Ok(Session {
+        id: row.try_get(0).map_err(pg_err)?,
+        agent: row.try_get(1).map_err(pg_err)?,
+        project: row.try_get(2).map_err(pg_err)?,
+        started_at: row.try_get(3).map_err(pg_err)?,
+        updated_at: row.try_get(4).map_err(pg_err)?,
+        metadata: row.try_get(5).map_err(pg_err)?,
+    })
+}
+
+fn row_to_message(row: &postgres::Row) -> IcmResult<Message> {
+    let role_str: String = row.try_get(2).map_err(pg_err)?;
+    Ok(Message {
+        id: row.try_get(0).map_err(pg_err)?,
+        session_id: row.try_get(1).map_err(pg_err)?,
+        role: Role::parse(&role_str).unwrap_or(Role::Tool),
+        content: row.try_get(3).map_err(pg_err)?,
+        tool_name: row.try_get(4).map_err(pg_err)?,
+        tokens: row.try_get(5).map_err(pg_err)?,
+        ts: row.try_get(6).map_err(pg_err)?,
+        metadata: row.try_get(7).map_err(pg_err)?,
+    })
 }
 
 impl TranscriptStore for PostgresStore {
     fn create_session(
         &self,
-        _agent: &str,
-        _project: Option<&str>,
-        _metadata: Option<&str>,
+        agent: &str,
+        project: Option<&str>,
+        metadata: Option<&str>,
     ) -> IcmResult<String> {
-        unsupported("transcript.create_session")
+        if self.readonly {
+            return Err(IcmError::ReadOnly("create_session".into()));
+        }
+        let session = Session::new(
+            agent.to_string(),
+            project.map(str::to_string),
+            metadata.map(str::to_string),
+        );
+        let mut c = self.conn()?;
+        c.execute(
+            "INSERT INTO sessions (id, agent, project, started_at, updated_at, metadata)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            &[
+                &session.id,
+                &session.agent,
+                &session.project,
+                &session.started_at,
+                &session.updated_at,
+                &session.metadata,
+            ],
+        )
+        .map_err(pg_err)?;
+        Ok(session.id)
     }
+
     fn ensure_session(
         &self,
-        _id: &str,
-        _agent: &str,
-        _project: Option<&str>,
-        _metadata: Option<&str>,
+        id: &str,
+        agent: &str,
+        project: Option<&str>,
+        metadata: Option<&str>,
     ) -> IcmResult<String> {
-        unsupported("transcript.ensure_session")
+        if self.readonly {
+            return Err(IcmError::ReadOnly("ensure_session".into()));
+        }
+        // ON CONFLICT DO NOTHING keeps the first row stable across re-fires
+        // (the id is the host agent's own session id).
+        let now = Utc::now();
+        let meta = metadata.unwrap_or("{}");
+        let mut c = self.conn()?;
+        c.execute(
+            "INSERT INTO sessions (id, agent, project, started_at, updated_at, metadata)
+             VALUES ($1, $2, $3, $4, $4, $5)
+             ON CONFLICT (id) DO NOTHING",
+            &[&id, &agent, &project, &now, &meta],
+        )
+        .map_err(pg_err)?;
+        Ok(id.to_string())
     }
-    fn get_session(&self, _id: &str) -> IcmResult<Option<Session>> {
-        unsupported("transcript.get_session")
+
+    fn get_session(&self, id: &str) -> IcmResult<Option<Session>> {
+        let mut c = self.conn()?;
+        let row = c
+            .query_opt(
+                &format!("SELECT {SESSION_COLS} FROM sessions WHERE id = $1"),
+                &[&id],
+            )
+            .map_err(pg_err)?;
+        row.as_ref().map(row_to_session).transpose()
     }
-    fn list_sessions(&self, _project: Option<&str>, _limit: usize) -> IcmResult<Vec<Session>> {
-        unsupported("transcript.list_sessions")
+
+    fn list_sessions(&self, project: Option<&str>, limit: usize) -> IcmResult<Vec<Session>> {
+        let mut c = self.conn()?;
+        let lim = limit as i64;
+        let rows = match project {
+            Some(p) => c
+                .query(
+                    &format!(
+                        "SELECT {SESSION_COLS} FROM sessions WHERE project = $1
+                         ORDER BY updated_at DESC LIMIT $2"
+                    ),
+                    &[&p, &lim],
+                )
+                .map_err(pg_err)?,
+            None => c
+                .query(
+                    &format!(
+                        "SELECT {SESSION_COLS} FROM sessions ORDER BY updated_at DESC LIMIT $1"
+                    ),
+                    &[&lim],
+                )
+                .map_err(pg_err)?,
+        };
+        rows.iter().map(row_to_session).collect()
     }
+
     fn record_message(
         &self,
-        _session_id: &str,
-        _role: Role,
-        _content: &str,
-        _tool_name: Option<&str>,
-        _tokens: Option<i64>,
-        _metadata: Option<&str>,
+        session_id: &str,
+        role: Role,
+        content: &str,
+        tool_name: Option<&str>,
+        tokens: Option<i64>,
+        metadata: Option<&str>,
     ) -> IcmResult<String> {
-        unsupported("transcript.record_message")
+        if self.readonly {
+            return Err(IcmError::ReadOnly("record_message".into()));
+        }
+        let msg = Message::new(
+            session_id.to_string(),
+            role,
+            content.to_string(),
+            tool_name.map(str::to_string),
+            tokens,
+            metadata.map(str::to_string),
+        );
+        let mut c = self.conn()?;
+        // Friendlier NotFound than a raw FK violation.
+        let exists: bool = c
+            .query_one(
+                "SELECT COUNT(*) > 0 FROM sessions WHERE id = $1",
+                &[&session_id],
+            )
+            .map_err(pg_err)?
+            .try_get(0)
+            .map_err(pg_err)?;
+        if !exists {
+            return Err(IcmError::NotFound(format!(
+                "session {session_id} does not exist"
+            )));
+        }
+        // Insert the message and bump the session mtime atomically.
+        let mut tx = c.transaction().map_err(pg_err)?;
+        tx.execute(
+            "INSERT INTO messages (id, session_id, role, content, tool_name, tokens, ts, metadata)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            &[
+                &msg.id,
+                &msg.session_id,
+                &msg.role.as_str(),
+                &msg.content,
+                &msg.tool_name,
+                &msg.tokens,
+                &msg.ts,
+                &msg.metadata,
+            ],
+        )
+        .map_err(pg_err)?;
+        tx.execute(
+            "UPDATE sessions SET updated_at = $1 WHERE id = $2",
+            &[&msg.ts, &session_id],
+        )
+        .map_err(pg_err)?;
+        tx.commit().map_err(pg_err)?;
+        Ok(msg.id)
     }
+
     fn list_session_messages(
         &self,
-        _session_id: &str,
-        _limit: usize,
-        _offset: usize,
+        session_id: &str,
+        limit: usize,
+        offset: usize,
     ) -> IcmResult<Vec<Message>> {
-        unsupported("transcript.list_session_messages")
+        let mut c = self.conn()?;
+        let (lim, off) = (limit as i64, offset as i64);
+        let rows = c
+            .query(
+                &format!(
+                    "SELECT {MESSAGE_COLS} FROM messages WHERE session_id = $1
+                     ORDER BY ts ASC LIMIT $2 OFFSET $3"
+                ),
+                &[&session_id, &lim, &off],
+            )
+            .map_err(pg_err)?;
+        rows.iter().map(row_to_message).collect()
     }
+
     fn search_transcripts(
         &self,
-        _query: &str,
-        _session_id: Option<&str>,
-        _project: Option<&str>,
-        _limit: usize,
+        query: &str,
+        session_id: Option<&str>,
+        project: Option<&str>,
+        limit: usize,
     ) -> IcmResult<Vec<TranscriptHit>> {
-        unsupported("transcript.search_transcripts")
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let lim = limit as i64;
+        // ts_rank scores higher = better (TranscriptHit.score is
+        // higher-is-better; the SQLite backend negates bm25 to match).
+        // Message columns are m.-prefixed: `id`/`metadata` collide with the
+        // joined sessions table otherwise.
+        let mut sql = String::from(
+            "SELECT m.id, m.session_id, m.role, m.content, m.tool_name, m.tokens, m.ts, m.metadata,
+                    s.id, s.agent, s.project, s.started_at, s.updated_at, s.metadata,
+                    ts_rank(m.fts, plainto_tsquery('simple', $1)) AS score
+             FROM messages m
+             JOIN sessions s ON s.id = m.session_id
+             WHERE m.fts @@ plainto_tsquery('simple', $1)",
+        );
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&query];
+        let mut idx = 1;
+        if let Some(sid) = session_id.as_ref() {
+            idx += 1;
+            sql.push_str(&format!(" AND m.session_id = ${idx}"));
+            params.push(sid);
+        }
+        if let Some(p) = project.as_ref() {
+            idx += 1;
+            sql.push_str(&format!(" AND s.project = ${idx}"));
+            params.push(p);
+        }
+        idx += 1;
+        sql.push_str(&format!(" ORDER BY score DESC LIMIT ${idx}"));
+        params.push(&lim);
+
+        let mut c = self.conn()?;
+        let rows = c.query(sql.as_str(), &params).map_err(pg_err)?;
+        let mut hits = Vec::with_capacity(rows.len());
+        for row in &rows {
+            // Message columns 0..=7, session columns 8..=13, score at 14.
+            let role_str: String = row.try_get(2).map_err(pg_err)?;
+            let message = Message {
+                id: row.try_get(0).map_err(pg_err)?,
+                session_id: row.try_get(1).map_err(pg_err)?,
+                role: Role::parse(&role_str).unwrap_or(Role::Tool),
+                content: row.try_get(3).map_err(pg_err)?,
+                tool_name: row.try_get(4).map_err(pg_err)?,
+                tokens: row.try_get(5).map_err(pg_err)?,
+                ts: row.try_get(6).map_err(pg_err)?,
+                metadata: row.try_get(7).map_err(pg_err)?,
+            };
+            let session = Session {
+                id: row.try_get(8).map_err(pg_err)?,
+                agent: row.try_get(9).map_err(pg_err)?,
+                project: row.try_get(10).map_err(pg_err)?,
+                started_at: row.try_get(11).map_err(pg_err)?,
+                updated_at: row.try_get(12).map_err(pg_err)?,
+                metadata: row.try_get(13).map_err(pg_err)?,
+            };
+            let score: f32 = row.try_get(14).map_err(pg_err)?;
+            hits.push(TranscriptHit {
+                message,
+                session,
+                score: score as f64,
+            });
+        }
+        Ok(hits)
     }
-    fn forget_session(&self, _id: &str) -> IcmResult<()> {
-        unsupported("transcript.forget_session")
+
+    fn forget_session(&self, id: &str) -> IcmResult<()> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("forget_session".into()));
+        }
+        // Messages drop via ON DELETE CASCADE; delete explicitly too so the
+        // behavior holds even if the FK were ever dropped.
+        let mut c = self.conn()?;
+        let mut tx = c.transaction().map_err(pg_err)?;
+        tx.execute("DELETE FROM messages WHERE session_id = $1", &[&id])
+            .map_err(pg_err)?;
+        tx.execute("DELETE FROM sessions WHERE id = $1", &[&id])
+            .map_err(pg_err)?;
+        tx.commit().map_err(pg_err)?;
+        Ok(())
     }
+
     fn transcript_stats(&self) -> IcmResult<TranscriptStats> {
-        unsupported("transcript.transcript_stats")
+        let mut c = self.conn()?;
+        let scalar_i64 = |c: &mut MutexGuard<'_, Client>, sql: &str| -> IcmResult<i64> {
+            c.query_one(sql, &[])
+                .map_err(pg_err)?
+                .try_get(0)
+                .map_err(pg_err)
+        };
+        let total_sessions = scalar_i64(&mut c, "SELECT COUNT(*) FROM sessions")? as usize;
+        let total_messages = scalar_i64(&mut c, "SELECT COUNT(*) FROM messages")? as usize;
+        let total_bytes = scalar_i64(
+            &mut c,
+            "SELECT COALESCE(SUM(length(content)), 0) FROM messages",
+        )? as u64;
+
+        let pairs =
+            |c: &mut MutexGuard<'_, Client>, sql: &str| -> IcmResult<Vec<(String, usize)>> {
+                let rows = c.query(sql, &[]).map_err(pg_err)?;
+                let mut out = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    let k: String = row.try_get(0).map_err(pg_err)?;
+                    let n: i64 = row.try_get(1).map_err(pg_err)?;
+                    out.push((k, n as usize));
+                }
+                Ok(out)
+            };
+        let by_role = pairs(
+            &mut c,
+            "SELECT role, COUNT(*) FROM messages GROUP BY role ORDER BY 2 DESC",
+        )?;
+        let by_agent = pairs(
+            &mut c,
+            "SELECT agent, COUNT(*) FROM sessions GROUP BY agent ORDER BY 2 DESC",
+        )?;
+        let top_sessions = pairs(
+            &mut c,
+            "SELECT session_id, COUNT(*) FROM messages
+             GROUP BY session_id ORDER BY 2 DESC LIMIT 10",
+        )?;
+
+        let row = c
+            .query_one("SELECT MIN(ts), MAX(ts) FROM messages", &[])
+            .map_err(pg_err)?;
+        let oldest: Option<DateTime<Utc>> = row.try_get(0).map_err(pg_err)?;
+        let newest: Option<DateTime<Utc>> = row.try_get(1).map_err(pg_err)?;
+
+        Ok(TranscriptStats {
+            total_sessions,
+            total_messages,
+            total_bytes,
+            by_role,
+            by_agent,
+            top_sessions,
+            oldest,
+            newest,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Integration tests (F-003a) — gated on ICM_POSTGRES_URL.
+//
+// These skip cleanly when ICM_POSTGRES_URL is unset, so the default
+// `cargo test` is unaffected. Run against a live PG, e.g.:
+//   docker run -d --name icm-pg -e POSTGRES_USER=icm -e POSTGRES_PASSWORD=icm \
+//     -e POSTGRES_DB=icm -p 5432:5432 pgvector/pgvector:pg16
+//   ICM_POSTGRES_URL=postgres://icm:icm@localhost:5432/icm \
+//     cargo test -p icm-store --features postgres
+// ---------------------------------------------------------------------------
+#[cfg(all(test, feature = "postgres"))]
+mod pg_tests {
+    use super::*;
+
+    /// Connect to the PG named by `ICM_POSTGRES_URL`, or return `None` so the
+    /// test skips cleanly when no PG is configured.
+    fn pg() -> Option<PostgresStore> {
+        std::env::var("ICM_POSTGRES_URL").ok()?;
+        Some(PostgresStore::connect(384, false).expect("connect ICM_POSTGRES_URL"))
+    }
+
+    /// Truncate every data table so each test starts empty. Ignores missing
+    /// tables so it is safe even before the schema exists.
+    fn reset(s: &PostgresStore) {
+        let mut c = s.conn().expect("lock");
+        for t in [
+            "messages",
+            "sessions",
+            "concept_links",
+            "concepts",
+            "memoirs",
+            "feedback",
+            "facts",
+            "memories",
+        ] {
+            let _ = c.execute(&format!("TRUNCATE TABLE {t} CASCADE"), &[]);
+        }
+    }
+
+    fn table_exists(s: &PostgresStore, t: &str) -> bool {
+        let mut c = s.conn().expect("lock");
+        c.query_one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)",
+            &[&t],
+        )
+        .expect("query")
+        .get::<_, bool>(0)
+    }
+
+    fn table_columns(s: &PostgresStore, t: &str) -> Vec<String> {
+        let mut c = s.conn().expect("lock");
+        c.query(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = $1",
+            &[&t],
+        )
+        .expect("query")
+        .iter()
+        .map(|r| r.get::<_, String>(0))
+        .collect()
+    }
+
+    #[test]
+    fn pg_schema_has_all_subsystem_tables_and_tenant() {
+        let Some(s) = pg() else {
+            return;
+        };
+        for t in [
+            "memoirs",
+            "concepts",
+            "concept_links",
+            "feedback",
+            "sessions",
+            "messages",
+            "facts",
+        ] {
+            assert!(table_exists(&s, t), "missing table {t}");
+            assert!(
+                table_columns(&s, t).iter().any(|c| c == "tenant"),
+                "{t}.tenant not pre-seeded"
+            );
+        }
+        // Idempotency: a second connect re-runs init_schema as a no-op.
+        assert!(PostgresStore::connect(384, false).is_ok());
+    }
+
+    #[test]
+    fn pg_harness_connects_and_resets() {
+        let Some(s) = pg() else {
+            return;
+        };
+        reset(&s);
+        assert_eq!(s.count().expect("count"), 0);
+    }
+
+    #[test]
+    fn pg_facts_versioning_and_history() {
+        let Some(s) = pg() else {
+            return;
+        };
+        reset(&s);
+        s.set_fact("user", "editor", "vim", "t").unwrap();
+        // Same value re-asserted → no-op (no new history row).
+        s.set_fact("user", "editor", "vim", "t2").unwrap();
+        assert_eq!(s.history("user", "editor").unwrap().len(), 1);
+        // Different value → supersede old, insert new active row.
+        s.set_fact("user", "editor", "emacs", "t").unwrap();
+        assert_eq!(
+            s.get_fact("user", "editor").unwrap().unwrap().value,
+            "emacs"
+        );
+        let hist = s.history("user", "editor").unwrap();
+        assert_eq!(hist.len(), 2, "vim (superseded) + emacs (active)");
+        assert_eq!(hist[0].value, "emacs", "history is newest-first");
+        // list_facts: active only, prefix-filtered, alphabetical.
+        s.set_fact("user", "shell", "zsh", "t").unwrap();
+        assert_eq!(s.list_facts("user", Some("edi")).unwrap().len(), 1);
+        assert_eq!(s.list_facts("user", None).unwrap().len(), 2);
+        // stats
+        let st = s.facts_stats().unwrap();
+        assert_eq!(st.active_count, 2);
+        assert_eq!(st.total_count, 3, "2 active + 1 superseded");
+        assert_eq!(st.distinct_entities, 1);
+        // forget removes active + history for the slot.
+        assert_eq!(s.forget_fact("user", "editor").unwrap(), 2);
+        assert!(s.get_fact("user", "editor").unwrap().is_none());
+    }
+
+    #[test]
+    fn pg_feedback_search_and_apply() {
+        let Some(s) = pg() else {
+            return;
+        };
+        reset(&s);
+        let id = s
+            .store_feedback(Feedback::new(
+                "routing".into(),
+                "ctx".into(),
+                "predicted X".into(),
+                "use Y instead".into(),
+                Some("reason".into()),
+                "test".into(),
+            ))
+            .unwrap();
+        // tsvector full-text search finds the row by a content word.
+        let hits = s.search_feedback("instead", None, 10).unwrap();
+        assert!(hits.iter().any(|f| f.id == id));
+        // topic filter + empty-query fallback to list.
+        assert_eq!(s.list_feedback(Some("routing"), 10).unwrap().len(), 1);
+        assert_eq!(s.search_feedback("   ", None, 10).unwrap().len(), 1);
+        assert!(s
+            .search_feedback("instead", Some("other"), 10)
+            .unwrap()
+            .is_empty());
+        // applied counter + stats.
+        s.increment_applied(&id).unwrap();
+        let st = s.feedback_stats().unwrap();
+        assert_eq!(st.total, 1);
+        assert!(st.most_applied.iter().any(|(fid, n)| *fid == id && *n == 1));
+        // delete.
+        s.delete_feedback(&id).unwrap();
+        assert!(s.list_feedback(None, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pg_transcript_store_search_replay() {
+        let Some(s) = pg() else {
+            return;
+        };
+        reset(&s);
+        let sid = s
+            .ensure_session("sess-1", "claude", Some("icm"), None)
+            .unwrap();
+        // ensure_session is idempotent — same id on re-fire.
+        assert_eq!(
+            s.ensure_session("sess-1", "claude", Some("icm"), None)
+                .unwrap(),
+            sid
+        );
+        s.record_message(&sid, Role::User, "how does routing work", None, None, None)
+            .unwrap();
+        s.record_message(
+            &sid,
+            Role::Assistant,
+            "routing uses the store enum",
+            None,
+            Some(12),
+            None,
+        )
+        .unwrap();
+        // Chronological replay.
+        let msgs = s.list_session_messages(&sid, 100, 0).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, Role::User);
+        assert_eq!(msgs[1].tokens, Some(12));
+        // tsvector search, scoped by project.
+        let hits = s
+            .search_transcripts("routing", None, Some("icm"), 10)
+            .unwrap();
+        assert!(!hits.is_empty());
+        assert!(hits
+            .iter()
+            .all(|h| h.session.project.as_deref() == Some("icm")));
+        // recording into a missing session is a typed NotFound, not an FK panic.
+        assert!(s
+            .record_message("nope", Role::User, "x", None, None, None)
+            .is_err());
+        // stats.
+        let st = s.transcript_stats().unwrap();
+        assert_eq!(st.total_sessions, 1);
+        assert_eq!(st.total_messages, 2);
+        // cascade delete.
+        s.forget_session(&sid).unwrap();
+        assert!(s.get_session(&sid).unwrap().is_none());
+        assert_eq!(s.list_session_messages(&sid, 100, 0).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn pg_memoir_and_concept_crud() {
+        let Some(s) = pg() else {
+            return;
+        };
+        reset(&s);
+        let mid = s
+            .create_memoir(Memoir::new("arch".into(), "desc".into()))
+            .unwrap();
+        assert_eq!(s.get_memoir_by_name("arch").unwrap().unwrap().id, mid);
+        assert_eq!(s.get_memoir(&mid).unwrap().unwrap().name, "arch");
+
+        let cid = s
+            .add_concept(Concept::new(
+                mid.clone(),
+                "store enum".into(),
+                "runtime backend dispatch".into(),
+            ))
+            .unwrap();
+        assert_eq!(
+            s.get_concept_by_name(&mid, "store enum")
+                .unwrap()
+                .unwrap()
+                .id,
+            cid
+        );
+
+        // update round-trips confidence + JSON labels.
+        let mut c = s.get_concept(&cid).unwrap().unwrap();
+        c.confidence = 0.9;
+        c.labels = vec![Label::new("tag", "core")];
+        s.update_concept(&c).unwrap();
+        let got = s.get_concept(&cid).unwrap().unwrap();
+        assert_eq!(got.confidence, 0.9);
+        assert_eq!(got.labels, vec![Label::new("tag", "core")]);
+
+        s.delete_concept(&cid).unwrap();
+        assert!(s.get_concept(&cid).unwrap().is_none());
+        s.delete_memoir(&mid).unwrap();
+        assert!(s.list_memoirs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pg_memoir_search_and_refine() {
+        let Some(s) = pg() else {
+            return;
+        };
+        reset(&s);
+        let mid = s
+            .create_memoir(Memoir::new("arch".into(), "d".into()))
+            .unwrap();
+        let mut concept = Concept::new(
+            mid.clone(),
+            "routing".into(),
+            "dispatch via store enum".into(),
+        );
+        concept.labels = vec![Label::new("layer", "core")];
+        let cid = s.add_concept(concept).unwrap();
+
+        assert_eq!(s.list_concepts(&mid).unwrap().len(), 1);
+        // tsvector concept search, scoped + cross-memoir.
+        assert!(s
+            .search_concepts_fts(&mid, "dispatch", 10)
+            .unwrap()
+            .iter()
+            .any(|c| c.id == cid));
+        assert!(s
+            .search_all_concepts_fts("dispatch", 10)
+            .unwrap()
+            .iter()
+            .any(|c| c.id == cid));
+        assert!(s.search_concepts_fts(&mid, "   ", 10).unwrap().is_empty());
+        // label search over the JSON labels column.
+        assert!(s
+            .search_concepts_by_label(&mid, &Label::new("layer", "core"), 10)
+            .unwrap()
+            .iter()
+            .any(|c| c.id == cid));
+        // refine merges sources, bumps revision + confidence.
+        let before = s.get_concept(&cid).unwrap().unwrap();
+        s.refine_concept(&cid, "dispatch via runtime store enum", &["m1".to_string()])
+            .unwrap();
+        let after = s.get_concept(&cid).unwrap().unwrap();
+        assert_eq!(after.revision, before.revision + 1);
+        assert!(after.confidence > before.confidence);
+        assert!(after.source_memory_ids.contains(&"m1".to_string()));
+        assert_eq!(after.definition, "dispatch via runtime store enum");
+    }
+
+    #[test]
+    fn pg_memoir_graph_and_stats() {
+        let Some(s) = pg() else {
+            return;
+        };
+        reset(&s);
+        let m = s
+            .create_memoir(Memoir::new("arch".into(), "d".into()))
+            .unwrap();
+        let mk = |name: &str| {
+            let mut c = Concept::new(m.clone(), name.into(), "x".into());
+            c.labels = vec![Label::new("k", name)];
+            c
+        };
+        let a = s.add_concept(mk("A")).unwrap();
+        let b = s.add_concept(mk("B")).unwrap();
+        let cc = s.add_concept(mk("C")).unwrap();
+        s.add_link(ConceptLink::new(a.clone(), b.clone(), Relation::RelatedTo))
+            .unwrap();
+        s.add_link(ConceptLink::new(b.clone(), cc.clone(), Relation::RelatedTo))
+            .unwrap();
+
+        assert_eq!(s.get_links_from(&a).unwrap().len(), 1);
+        assert_eq!(s.get_links_to(&cc).unwrap().len(), 1);
+        // self-link and cycle (C→A closes A→B→C→A) are rejected.
+        assert!(s
+            .add_link(ConceptLink::new(a.clone(), a.clone(), Relation::RelatedTo))
+            .is_err());
+        assert!(s
+            .add_link(ConceptLink::new(cc.clone(), a.clone(), Relation::RelatedTo))
+            .is_err());
+
+        // Undirected neighbors + depth-bounded neighborhood (A→B→C).
+        assert!(s.get_neighbors(&a, None).unwrap().iter().any(|n| n.id == b));
+        let (nodes, links) = s.get_neighborhood(&a, 2).unwrap();
+        assert!(nodes.iter().any(|n| n.id == cc));
+        assert!(links.len() >= 2);
+        assert_eq!(s.get_links_for_memoir(&m).unwrap().len(), 2);
+
+        // Stats.
+        let st = s.memoir_stats(&m).unwrap();
+        assert_eq!(st.total_concepts, 3);
+        assert_eq!(st.total_links, 2);
+        assert!(st.avg_confidence > 0.0);
+        assert_eq!(
+            *s.batch_memoir_concept_counts().unwrap().get(&m).unwrap(),
+            3
+        );
+
+        // delete_link.
+        let l = s.get_links_from(&a).unwrap().pop().unwrap();
+        s.delete_link(&l.id).unwrap();
+        assert_eq!(s.get_links_from(&a).unwrap().len(), 0);
     }
 }

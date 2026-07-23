@@ -101,3 +101,35 @@ jobs:
           else
             echo "No new dependencies added" >> $GITHUB_STEP_SUMMARY
           fi
+
+  postgres:
+    name: postgres integration (optional)
+    needs: clippy
+    runs-on: ubuntu-latest
+    # Optional gate (F-003a): exercises the PG backend's full subsystem
+    # parity (facts / memoir / feedback / transcript) against a live
+    # pgvector database. Non-blocking — a PG hiccup never red-walls the PR;
+    # the SQLite `test` job stays the required gate.
+    continue-on-error: true
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: icm
+          POSTGRES_PASSWORD: icm
+          POSTGRES_DB: icm
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U icm -d icm"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: PG integration tests (all subsystems, gated on ICM_POSTGRES_URL)
+        env:
+          ICM_POSTGRES_URL: postgres://icm:icm@localhost:5432/icm
+        run: cargo test -p icm-store --features postgres pg_ -- --test-threads=1
