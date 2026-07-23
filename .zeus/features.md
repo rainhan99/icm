@@ -7,6 +7,7 @@
 | F-003 | 远端记忆加固·一期(启发式 supersession + token→tenant 鉴权脚手架,不含数据隔离) | done | [spec](specs/2026-07-22-remote-memory-hardening-design.md) | [plan](plans/2026-07-22-remote-memory-hardening-plan.md) |
 | F-003a | 扩 Postgres 后端到全 5 子系统 + PG 测试脚手架(PG 多租户前提) | done | [spec](specs/2026-07-22-postgres-full-subsystem-design.md) | [plan](plans/2026-07-22-postgres-full-subsystem-plan.md) |
 | F-003b | PG 行级 tenant + Row-Level Security 数据隔离(依赖 F-003a) | done | [spec](specs/2026-07-23-postgres-tenant-rls-design.md) | [plan](plans/2026-07-23-postgres-tenant-rls-plan.md) |
+| F-003c | 修复 HTTP/web + Postgres async-blocking 冲突(store-actor 线程;demo 发现) | done | [spec](specs/2026-07-23-http-pg-async-fix-design.md) | [plan](plans/2026-07-23-http-pg-async-fix-plan.md) |
 
 ## F-001 — Definition of Done 子集
 
@@ -46,3 +47,13 @@
 - 门禁全绿:`fmt` / `clippy -D warnings`(默认 + postgres + cli http+remote)/ 无新依赖 / 注入 grep(仅 `set_config`)/ live PG 隔离测试 8+3 绿。
 - **诚实边界(关键运维要求):** RLS 仅在 **PG + 非超级用户角色**下生效(超级用户绕过 RLS);SQLite 不隔离;直连 CLI/admin(未设租户)不限制。文档 `docs/postgres-backend.md` 醒目标注。
 - 三段式多租户闭环:F-003(身份)+ F-003a(全子系统对等)+ F-003b(隔离)= 生产级 PG 多租户。
+
+## F-003c — Definition of Done(已达成)
+
+- 修复:`icm serve --http` / `--web` 叠加 postgres 后端首个 store 操作 panic
+  "Cannot start a runtime from within a runtime"(阻塞 PG 客户端在 tokio 线程上 block_on)。
+- 根因(探针实证):tokio 在 **async worker 和 spawn_blocking 池线程**都进入运行时上下文;唯有普通 `std::thread` 逃逸。故 spawn_blocking 无效,改用 **store-actor 专用线程**。
+- 实现:`store_actor.rs` 一条 `std::thread` 拥有 Store(+embedder),经 mpsc 收 job、tokio oneshot 回结果;`StoreHandle`(Clone)入 AppState 替代 `Arc<Mutex<Store>>`;每 job `catch_unwind`(panic 不杀 actor、掉 oneshot→该请求 500);http_api 6 处理器 + web ~14 处理器全经 actor;set_tenant+查询同一 job(保 F-003b)。
+- 门禁:`fmt` / `clippy -D warnings`(默认 + http-api,web,postgres,remote-store)/ 默认 SQLite `cargo test --workspace` 全绿(零回归)/ 无新依赖(std thread/mpsc + tokio oneshot)。
+- live PG:actor 单测(SQLite,panic 不杀)+ http_pg + web_pg 门控测试绿(--test-threads=1);**端到端 demo:两 token→两租户经 HTTP+PG 不崩 + 隔离成立**(非超级用户 icm_app)。
+- 生产拓扑(瘦客户端→HTTP 中心节点→PG 多租户)现可用。
