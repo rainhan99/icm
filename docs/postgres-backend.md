@@ -44,14 +44,48 @@ Full-text search on these uses the same PostgreSQL `tsvector('simple')`
 GENERATED columns + GIN indexes as core memory. `ts_rank`/recency ordering
 differs slightly from SQLite's FTS5 `bm25`, but hit membership matches.
 
-> ### ⚠️ Multi-tenancy: not yet
+## Multi-tenant isolation (RLS, F-003b)
+
+A central Postgres node can serve **isolated tenants**: each tenant reads and
+writes only its own rows, enforced by PostgreSQL **Row-Level Security** — not
+by application code, so a missed filter cannot leak across tenants.
+
+How it fits together:
+
+1. **Identity (F-003):** the HTTP server maps each `Authorization: Bearer
+   <token>` to a tenant via the `[remote] tokens` map (see
+   `docs/remote-backend.md` §6).
+2. **Scope (F-003b):** each store-serving request sets the tenant on its
+   connection — `SELECT set_config('app.tenant', $1, false)` (the tenant is a
+   **bound parameter**, never interpolated) — on the same locked connection
+   as the query.
+3. **Enforcement (F-003b):** every tenant-scoped table has
+   `ENABLE`/`FORCE ROW LEVEL SECURITY` and a policy that allows a row iff
+   `tenant = current_setting('app.tenant', true)`. Writes auto-tag via a
+   column `DEFAULT current_setting('app.tenant', true)`.
+
+When `app.tenant` is unset (`NULL`/`''`) the policy is **unrestricted** — the
+single-dataset behavior used by direct CLI/admin access and by
+single-token / no-tokens-map deployments. Legacy rows created before F-003b
+are migrated to the `'default'` tenant on first connect.
+
+> ### ⚠️ Deployment requirements & limits
 >
-> Every new subsystem table carries a **nullable `tenant` column that
-> F-003a leaves unused** — it is scaffolding for F-003b. A Postgres node
-> today still serves **one shared dataset** (exactly like SQLite): there is
-> **no tenant data isolation**. Row-level tenant filtering + PostgreSQL
-> Row-Level Security are **F-003b**. Do not treat a shared Postgres node as
-> a boundary between mutually distrusting tenants until then.
+> - **Connect as a NON-SUPERUSER role.** PostgreSQL **bypasses RLS for
+>   superusers** (and for `BYPASSRLS` roles) — even with `FORCE`. The
+>   `ICM_POSTGRES_URL` role for a multi-tenant node MUST be an ordinary
+>   (non-superuser) role granted access to the ICM tables, or isolation is
+>   silently NOT enforced. (`FORCE ROW LEVEL SECURITY` covers the case where
+>   that role also owns the tables.)
+> - **SQLite is not isolated.** SQLite has no RLS; the SQLite backend always
+>   serves one dataset. Isolation is a Postgres-only guarantee.
+> - **Direct CLI/admin access is unrestricted.** `icm` run directly against
+>   Postgres (not via the HTTP node) leaves `app.tenant` unset → sees all
+>   tenants. The isolation boundary is the HTTP-served path (thin clients).
+> - **Session `SET`, single connection.** The tenant is set at session scope
+>   on the store's single guarded connection (safe because access is
+>   serialized). Introducing a **connection pool** later would require
+>   switching to `SET LOCAL` inside a per-request transaction.
 
 ## Requirements
 

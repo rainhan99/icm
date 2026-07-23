@@ -104,19 +104,24 @@ cargo build --release -p icm-cli \
 
 ## 6. Multi-tenant auth scaffold (F-003 phase-1)
 
-> ### ⚠️ This scaffold resolves IDENTITY, it does NOT isolate DATA
+> ### Identity here; data isolation via Postgres RLS (F-003b)
 >
-> With a `[remote] tokens` map configured, the server maps each Bearer token
-> to a **tenant name** and rejects unknown tokens — but **every tenant still
-> reads and writes the same shared store**. This layer is **not** a security
-> boundary between tenants: it does **not** isolate one tenant's memories
-> from another's. Cross-tenant data isolation (Postgres row-level tenant +
-> RLS) is **deferred to F-003b** and **not yet implemented**. Do **not**
-> deploy this as protection between mutually distrusting tenants.
+> A `[remote] tokens` map maps each Bearer token to a **tenant name** and
+> rejects unknown tokens. On its own this resolves *identity* — on the
+> **Postgres** backend, F-003b turns that identity into real **data
+> isolation** via Row-Level Security: each request is scoped to its tenant
+> (`SET app.tenant`) and RLS filters every read/write. See
+> `docs/postgres-backend.md` → "Multi-tenant isolation (RLS, F-003b)".
+>
+> **Caveats:** isolation requires the Postgres backend **and** connecting as
+> a **non-superuser** role (superusers bypass RLS). The **SQLite** backend
+> has no RLS and is **not** isolated (single dataset). Do not rely on a
+> SQLite node — or a superuser Postgres connection — as a boundary between
+> mutually distrusting tenants.
 
 F-001 ships a single global `--token`. F-003 phase-1 adds an optional
-**token → tenant** map so a central node can tell *who* is calling (identity),
-as scaffolding for the real isolation work in F-003b.
+**token → tenant** map so a central node can tell *who* is calling
+(identity); F-003b makes that a data boundary on Postgres (RLS).
 
 Configure it on the **central** node's `~/.config/icm/config.toml`:
 
