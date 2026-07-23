@@ -1787,30 +1787,183 @@ impl FeedbackStore for PostgresStore {
     }
 }
 
+/// Columns selected for a [`Fact`], in `row_to_fact` order.
+const FACT_COLS: &str = "id, entity, key, value, source, created_at, superseded_at";
+
+fn row_to_fact(row: &postgres::Row) -> IcmResult<Fact> {
+    Ok(Fact {
+        id: row.try_get(0).map_err(pg_err)?,
+        entity: row.try_get(1).map_err(pg_err)?,
+        key: row.try_get(2).map_err(pg_err)?,
+        value: row.try_get(3).map_err(pg_err)?,
+        source: row.try_get(4).map_err(pg_err)?,
+        created_at: row.try_get(5).map_err(pg_err)?,
+        superseded_at: row.try_get(6).map_err(pg_err)?,
+    })
+}
+
 impl FactsStore for PostgresStore {
-    fn set_fact(
-        &self,
-        _entity: &str,
-        _key: &str,
-        _value: &str,
-        _source: &str,
-    ) -> IcmResult<String> {
-        unsupported("facts.set_fact")
+    fn set_fact(&self, entity: &str, key: &str, value: &str, source: &str) -> IcmResult<String> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("set_fact".into()));
+        }
+        if entity.is_empty() || key.is_empty() {
+            return Err(IcmError::InvalidInput(
+                "entity and key must be non-empty".into(),
+            ));
+        }
+        let mut c = self.conn()?;
+        // Transactional supersede+insert so two concurrent writers can't
+        // both land an active row for the same (entity, key) slot.
+        let mut tx = c.transaction().map_err(pg_err)?;
+        let existing = tx
+            .query_opt(
+                "SELECT id, value FROM facts
+                 WHERE entity = $1 AND key = $2 AND superseded_at IS NULL",
+                &[&entity, &key],
+            )
+            .map_err(pg_err)?;
+        if let Some(row) = existing {
+            let id: String = row.try_get(0).map_err(pg_err)?;
+            let current: String = row.try_get(1).map_err(pg_err)?;
+            if current == value {
+                // Same value re-asserted → no-op.
+                tx.commit().map_err(pg_err)?;
+                return Ok(id);
+            }
+            tx.execute(
+                "UPDATE facts SET superseded_at = $1 WHERE id = $2",
+                &[&Utc::now(), &id],
+            )
+            .map_err(pg_err)?;
+        }
+        let new = Fact::new(
+            entity.to_string(),
+            key.to_string(),
+            value.to_string(),
+            source.to_string(),
+        );
+        tx.execute(
+            "INSERT INTO facts (id, entity, key, value, source, created_at, superseded_at)
+             VALUES ($1, $2, $3, $4, $5, $6, NULL)",
+            &[
+                &new.id,
+                &new.entity,
+                &new.key,
+                &new.value,
+                &new.source,
+                &new.created_at,
+            ],
+        )
+        .map_err(pg_err)?;
+        tx.commit().map_err(pg_err)?;
+        Ok(new.id)
     }
-    fn get_fact(&self, _entity: &str, _key: &str) -> IcmResult<Option<Fact>> {
-        unsupported("facts.get_fact")
+
+    fn get_fact(&self, entity: &str, key: &str) -> IcmResult<Option<Fact>> {
+        let mut c = self.conn()?;
+        let row = c
+            .query_opt(
+                &format!(
+                    "SELECT {FACT_COLS} FROM facts
+                     WHERE entity = $1 AND key = $2 AND superseded_at IS NULL"
+                ),
+                &[&entity, &key],
+            )
+            .map_err(pg_err)?;
+        row.as_ref().map(row_to_fact).transpose()
     }
-    fn list_facts(&self, _entity: &str, _key_prefix: Option<&str>) -> IcmResult<Vec<Fact>> {
-        unsupported("facts.list_facts")
+
+    fn list_facts(&self, entity: &str, key_prefix: Option<&str>) -> IcmResult<Vec<Fact>> {
+        let mut c = self.conn()?;
+        let rows = match key_prefix {
+            Some(p) if !p.is_empty() => {
+                let pattern = format!("{p}%");
+                c.query(
+                    &format!(
+                        "SELECT {FACT_COLS} FROM facts
+                         WHERE entity = $1 AND key LIKE $2 AND superseded_at IS NULL
+                         ORDER BY key ASC"
+                    ),
+                    &[&entity, &pattern],
+                )
+                .map_err(pg_err)?
+            }
+            _ => c
+                .query(
+                    &format!(
+                        "SELECT {FACT_COLS} FROM facts
+                         WHERE entity = $1 AND superseded_at IS NULL
+                         ORDER BY key ASC"
+                    ),
+                    &[&entity],
+                )
+                .map_err(pg_err)?,
+        };
+        rows.iter().map(row_to_fact).collect()
     }
-    fn history(&self, _entity: &str, _key: &str) -> IcmResult<Vec<Fact>> {
-        unsupported("facts.history")
+
+    fn history(&self, entity: &str, key: &str) -> IcmResult<Vec<Fact>> {
+        let mut c = self.conn()?;
+        let rows = c
+            .query(
+                &format!(
+                    "SELECT {FACT_COLS} FROM facts
+                     WHERE entity = $1 AND key = $2
+                     ORDER BY created_at DESC"
+                ),
+                &[&entity, &key],
+            )
+            .map_err(pg_err)?;
+        rows.iter().map(row_to_fact).collect()
     }
-    fn forget_fact(&self, _entity: &str, _key: &str) -> IcmResult<usize> {
-        unsupported("facts.forget_fact")
+
+    fn forget_fact(&self, entity: &str, key: &str) -> IcmResult<usize> {
+        if self.readonly {
+            return Err(IcmError::ReadOnly("forget_fact".into()));
+        }
+        let mut c = self.conn()?;
+        let n = c
+            .execute(
+                "DELETE FROM facts WHERE entity = $1 AND key = $2",
+                &[&entity, &key],
+            )
+            .map_err(pg_err)?;
+        Ok(n as usize)
     }
+
     fn facts_stats(&self) -> IcmResult<FactsStats> {
-        unsupported("facts.facts_stats")
+        let mut c = self.conn()?;
+        let count = |c: &mut MutexGuard<'_, Client>, sql: &str| -> IcmResult<usize> {
+            let n: i64 = c.query_one(sql, &[]).map_err(pg_err)?.try_get(0).map_err(pg_err)?;
+            Ok(n as usize)
+        };
+        let active_count = count(&mut c, "SELECT COUNT(*) FROM facts WHERE superseded_at IS NULL")?;
+        let total_count = count(&mut c, "SELECT COUNT(*) FROM facts")?;
+        let distinct_entities = count(
+            &mut c,
+            "SELECT COUNT(DISTINCT entity) FROM facts WHERE superseded_at IS NULL",
+        )?;
+        let rows = c
+            .query(
+                "SELECT entity, COUNT(*) AS n FROM facts
+                 WHERE superseded_at IS NULL
+                 GROUP BY entity ORDER BY n DESC LIMIT 10",
+                &[],
+            )
+            .map_err(pg_err)?;
+        let mut top_entities = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let entity: String = row.try_get(0).map_err(pg_err)?;
+            let n: i64 = row.try_get(1).map_err(pg_err)?;
+            top_entities.push((entity, n as usize));
+        }
+        Ok(FactsStats {
+            active_count,
+            total_count,
+            distinct_entities,
+            top_entities,
+        })
     }
 }
 
@@ -1966,5 +2119,38 @@ mod pg_tests {
         };
         reset(&s);
         assert_eq!(s.count().expect("count"), 0);
+    }
+
+    #[test]
+    fn pg_facts_versioning_and_history() {
+        let Some(s) = pg() else {
+            return;
+        };
+        reset(&s);
+        s.set_fact("user", "editor", "vim", "t").unwrap();
+        // Same value re-asserted → no-op (no new history row).
+        s.set_fact("user", "editor", "vim", "t2").unwrap();
+        assert_eq!(s.history("user", "editor").unwrap().len(), 1);
+        // Different value → supersede old, insert new active row.
+        s.set_fact("user", "editor", "emacs", "t").unwrap();
+        assert_eq!(
+            s.get_fact("user", "editor").unwrap().unwrap().value,
+            "emacs"
+        );
+        let hist = s.history("user", "editor").unwrap();
+        assert_eq!(hist.len(), 2, "vim (superseded) + emacs (active)");
+        assert_eq!(hist[0].value, "emacs", "history is newest-first");
+        // list_facts: active only, prefix-filtered, alphabetical.
+        s.set_fact("user", "shell", "zsh", "t").unwrap();
+        assert_eq!(s.list_facts("user", Some("edi")).unwrap().len(), 1);
+        assert_eq!(s.list_facts("user", None).unwrap().len(), 2);
+        // stats
+        let st = s.facts_stats().unwrap();
+        assert_eq!(st.active_count, 2);
+        assert_eq!(st.total_count, 3, "2 active + 1 superseded");
+        assert_eq!(st.distinct_entities, 1);
+        // forget removes active + history for the slot.
+        assert_eq!(s.forget_fact("user", "editor").unwrap(), 2);
+        assert!(s.get_fact("user", "editor").unwrap().is_none());
     }
 }
