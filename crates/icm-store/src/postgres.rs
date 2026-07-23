@@ -1256,6 +1256,40 @@ fn init_schema(client: &mut Client, requested_dims: usize) -> IcmResult<usize> {
         )
         .map_err(pg_err)?;
 
+    // F-003b: Row-Level Security. Every read/write is filtered to the
+    // connection's tenant (`current_setting('app.tenant', true)`); an unset
+    // GUC (NULL/'') means unrestricted — today's single-dataset behavior and
+    // the direct-CLI/admin view. FORCE ROW LEVEL SECURITY so even the table
+    // owner is filtered. Idempotent: ENABLE/FORCE are no-ops when already on;
+    // policies use DROP IF EXISTS + CREATE (CREATE POLICY has no IF NOT
+    // EXISTS). The DO loop applies the identical policy to all eight
+    // tenant-scoped tables; `format('%I', t)` safely quotes each identifier.
+    client
+        .batch_execute(
+            "DO $do$
+             DECLARE t text;
+             BEGIN
+               FOREACH t IN ARRAY ARRAY[
+                 'memories','facts','memoirs','concepts',
+                 'concept_links','feedback','sessions','messages'
+               ] LOOP
+                 EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
+                 EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
+                 EXECUTE format('DROP POLICY IF EXISTS icm_tenant_isolation ON %I', t);
+                 EXECUTE format($pol$
+                   CREATE POLICY icm_tenant_isolation ON %I
+                     USING (current_setting('app.tenant', true) IS NULL
+                         OR current_setting('app.tenant', true) = ''
+                         OR tenant = current_setting('app.tenant', true))
+                     WITH CHECK (current_setting('app.tenant', true) IS NULL
+                         OR current_setting('app.tenant', true) = ''
+                         OR tenant = current_setting('app.tenant', true))
+                 $pol$, t);
+               END LOOP;
+             END $do$;",
+        )
+        .map_err(pg_err)?;
+
     Ok(dims)
 }
 
@@ -3444,5 +3478,64 @@ mod pg_tests {
             .unwrap();
         assert_eq!(tenant_of_row(&s, "memories", &id), "acme");
         s.set_tenant(None).unwrap();
+    }
+
+    /// A store whose connection has dropped to a **non-superuser** role via
+    /// `SET ROLE`. RLS (even FORCE) is bypassed by superusers/owners-without-
+    /// FORCE, and the test container's `icm` role is a superuser — so proving
+    /// isolation requires querying as a non-superuser, mirroring the
+    /// production requirement (documented in docs/postgres-backend.md).
+    /// Schema + truncate run first as the owner; then we grant a minimal
+    /// non-superuser role and switch to it.
+    fn pg_rls() -> Option<PostgresStore> {
+        let s = pg()?;
+        reset(&s); // owner truncates before we drop privileges
+        {
+            let mut c = s.conn().expect("lock");
+            c.batch_execute(
+                "DO $$ BEGIN
+                   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'icm_rls') THEN
+                     CREATE ROLE icm_rls NOSUPERUSER;
+                   END IF;
+                 END $$;
+                 GRANT USAGE ON SCHEMA public TO icm_rls;
+                 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO icm_rls;
+                 SET ROLE icm_rls;",
+            )
+            .expect("grant + SET ROLE icm_rls");
+        }
+        Some(s)
+    }
+
+    #[test]
+    fn rls_isolation_across_tenants() {
+        let Some(s) = pg_rls() else {
+            return;
+        };
+        // Tenant A stores a row; tenant B stores a row.
+        s.set_tenant(Some("A")).unwrap();
+        let a = s
+            .store(Memory::new("t".into(), "A secret".into(), Importance::High))
+            .unwrap();
+        s.set_tenant(Some("B")).unwrap();
+        let b = s
+            .store(Memory::new("t".into(), "B secret".into(), Importance::High))
+            .unwrap();
+
+        // B sees only B — across get and list.
+        assert!(s.get(&a).unwrap().is_none(), "B must not read A's row");
+        assert!(s.get(&b).unwrap().is_some());
+        let listed = s.list_all().unwrap();
+        assert_eq!(listed.len(), 1, "B lists only its own");
+        assert!(listed[0].summary.contains("B secret"));
+
+        // A sees only A.
+        s.set_tenant(Some("A")).unwrap();
+        assert!(s.get(&b).unwrap().is_none(), "A must not read B's row");
+        assert_eq!(s.list_all().unwrap().len(), 1);
+
+        // Unset tenant → unrestricted (today's single-dataset behavior).
+        s.set_tenant(None).unwrap();
+        assert_eq!(s.list_all().unwrap().len(), 2);
     }
 }
