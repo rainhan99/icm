@@ -241,9 +241,40 @@ curl -s -X POST '127.0.0.1:11435/recall?format=json' \
   -d '{"query":"hello","topic":"t"}'
 ```
 
-Endpoints: `POST /store`, `POST /recall`, `POST /consolidate`, `GET /stats`, `GET /topics`, `GET /health`. Optional `--token <T>` enables `Authorization: Bearer <T>` on every request (health stays open as a liveness probe). Bound to whatever address you pass; `127.0.0.1:<port>` keeps the server localhost-only.
+Endpoints: `POST /store`, `POST /recall`, `POST /consolidate`, `GET /stats`, `GET /topics`, `GET /whoami`, `GET /health`. Optional `--token <T>` enables `Authorization: Bearer <T>` on every request (health stays open as a liveness probe). For multi-tenant use, a `[remote] tokens` map resolves each token to a tenant (`/whoami` echoes it) — see Deployment below. Bound to whatever address you pass; `127.0.0.1:<port>` keeps the server localhost-only.
 
 Saves ~9 s per call vs one-shot CLI (model reload) — any scripting language can hit semantic recall with plain `curl`. Requires the `http-api` feature (enabled by default). Issue [#290](https://github.com/rtk-ai/icm/issues/290).
+
+## Deployment: shared memory for a team
+
+By default ICM is a single local SQLite file (see [Storage](#storage)). For a
+team — many machines sharing one project's memory, or a multi-tenant central
+node — ICM runs as **three tiers**: thin `icm` clients → one central
+`icm serve --http` node → a shared store (SQLite or **Postgres**). Clients
+carry no embedding model and no local DB; the central node embeds and stores.
+
+```bash
+# Central node — owns the DB + embedding. Postgres backend for real sharing:
+ICM_DB_BACKEND=postgres ICM_POSTGRES_URL=postgres://user:pass@host/icm \
+  icm serve --http 0.0.0.0:11435 --token "$TOKEN"
+
+# Each dev machine — zero model, zero local DB, just a thin client:
+export ICM_DB_BACKEND=remote ICM_REMOTE_URL=http://central:11435 ICM_REMOTE_TOKEN="$TOKEN"
+icm recall "database schema"      # embeds + stores on the central node
+```
+
+**Multi-tenant** (many teams, one Postgres node, isolated): map each token to
+a tenant under `[remote] tokens` and connect the node as a **non-superuser**
+role — Postgres Row-Level Security then scopes every read and write to the
+caller's tenant. `icm serve --web` (admin dashboard) works over Postgres too.
+
+Backends are selected at runtime via `ICM_DB_BACKEND` (`sqlite` (default) |
+`postgres` | `opensearch` | `remote`); the published binary embeds all of them.
+
+Full guides: **[docs/deployment.md](docs/deployment.md)** (production
+multi-tenant runbook) · [remote backend](docs/remote-backend.md) ·
+[Postgres backend](docs/postgres-backend.md) ·
+[OpenSearch backend](docs/opensearch-backend.md).
 
 ## Dashboard
 
@@ -338,6 +369,22 @@ icm transcript forget "$SID"
 Rust + SQLite + FTS5 — 0 Python, 0 ChromaDB, 0 external service. Writes are ~10× faster than
 ChromaDB-based verbatim stores; the whole transcript lives in the same SQLite file as your
 memories and memoirs.
+
+### Code graph (dependency queries, save tokens)
+
+A native code-dependency graph (Rust / TS-JS / Python / Go via tree-sitter):
+query symbols and call edges from a pre-built index instead of grepping and
+reading files — the way an agent answers "what calls this?" without burning
+context.
+
+```bash
+icm code index                    # build/refresh the graph for the repo
+icm code index --incremental      # re-index only files the hook marked stale
+icm code explore <symbol>         # callers, callees, definition — one call
+```
+
+Shares the active backend (`ICM_DB_BACKEND`, including `remote` for
+cross-machine sharing). See [docs/code-graph.md](docs/code-graph.md).
 
 ## MCP Tools (31)
 
@@ -451,15 +498,27 @@ Or set `enabled = false` in your config file. ICM will fall back to FTS5 keyword
 
 Changing the model automatically re-creates the vector index (existing embeddings are cleared and can be regenerated with `icm_memory_embed_all`).
 
+**Cloud embeddings** (optional): instead of the local model, the central node
+can embed via any OpenAI-compatible `/embeddings` endpoint — set
+`[embeddings] provider = "openai"`, `model`, `base_url`, `dimensions`, and the
+`ICM_EMBED_API_KEY` env var (never stored on disk, never logged). Repeated
+embeddings are cached (disk + in-memory LRU); view usage at `GET /cache` on a
+running `icm serve --http` node.
+
 ### Storage
 
-Single SQLite file. No external services, no network dependency.
+By default, a single SQLite file — no external services, no network dependency:
 
 ```
 ~/Library/Application Support/dev.icm.icm/memories.db                    # macOS
 ~/.local/share/dev.icm.icm/memories.db                                   # Linux
 C:\Users\<user>\AppData\Local\icm\icm\data\memories.db                   # Windows
 ```
+
+The storage backend is **pluggable at runtime** via `ICM_DB_BACKEND`:
+`sqlite` (default, local), `postgres` (shared, pgvector), `opensearch`
+(shared, BM25 + kNN), or `remote` (thin client → central node). All are
+compiled into the published binary. See [Deployment](#deployment-shared-memory-for-a-team).
 
 ### Configuration
 
