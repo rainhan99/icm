@@ -24,13 +24,19 @@
 //!   `DATABASE_URL` as a fallback). The `&Path` arguments that the CLI
 //!   passes for the SQLite file are ignored.
 //!
-//! Scope of this first cut: the full [`MemoryStore`] surface (the core
-//! shared-memory use case behind #301) plus the ancillary tables used by
-//! the normal store/recall/hook path (hook telemetry, the extraction
-//! queue, code areas, the key/value metadata). The heavier subsystems
-//! (memoir graph, transcripts, structured facts, feedback, pattern
-//! mining) return [`IcmError::Unsupported`] on this backend for now;
-//! they remain fully available on the default SQLite backend.
+//! Scope: full parity with the SQLite backend across the [`MemoryStore`],
+//! [`FactsStore`], [`MemoirStore`], [`FeedbackStore`], and
+//! [`TranscriptStore`] surfaces (F-003a), plus the ancillary tables used by
+//! the normal store/recall/hook path (hook telemetry, the extraction queue,
+//! code areas, the key/value metadata). Only **pattern mining**
+//! (`detect_patterns` / `extract_pattern_as_concept`) still returns
+//! [`IcmError::Unsupported`] here; it remains available on the default
+//! SQLite backend.
+//!
+//! Multi-tenant note: every F-003a table has a nullable `tenant` column that
+//! is currently unused (scaffolding for F-003b). This backend does NOT
+//! isolate tenant data — a shared node serves one dataset. Isolation
+//! (row-level tenant + RLS) is F-003b.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
